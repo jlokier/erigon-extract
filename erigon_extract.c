@@ -85,11 +85,12 @@ bool quiet = false;
 const char *prog;
 
 #define PRINT 0
-#define CODE_BLOCK_NUMBER 1  /* Range 1..8     */
-#define CODE_ADDRESS      9  /* Single value 9 */
-#define CODE_ACCOUNT      10 /* Range 10..73   */
-#define CODE_STORAGE      74 /* Range 74..249  */
-#define CODE_INCARNATION  250 /* Single value  */
+#define CODE_BLOCK_NUMBER 1  /* Range 1..8        */
+#define CODE_ADDRESS      9  /* Single value 9    */
+#define CODE_ACCOUNT      10 /* Range 10..73      */
+#define CODE_STORAGE      74 /* Range 74..249     */
+#define CODE_INCARNATION  250 /* Single value 250 */
+#define CODE_BLOCK_INLINE 251 /* Range 251..255   */
 
 static void error(const char *func, int rc) {
 	if (!quiet)
@@ -129,13 +130,14 @@ static uint64_t get64be_len(const byte *bytes, size_t len) {
 }
 
 #define ADDRESS_LEN     20
+#define BALANCE_LEN     32
 #define HASH_LEN        32
 #define SLOT_LEN        32
 #define VALUE_LEN       32
 #define BLOCK_LEN       8
 #define INCARNATION_LEN 8
 
-static const byte zero_balance[VALUE_LEN] = { 0, };
+static const byte zero_balance[BALANCE_LEN] = { 0, };
 static const byte zero_code_hash[HASH_LEN] = { 0, };
 static const byte empty_code_hash[HASH_LEN] = {
 	0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2,
@@ -152,7 +154,7 @@ struct ReaderItem {
 struct Account {
 	struct ReaderItem item_base;
 	uint64_t nonce, incarnation;
-	byte balance[VALUE_LEN], codeHash[HASH_LEN];
+	byte balance[BALANCE_LEN], codeHash[HASH_LEN];
 };
 
 struct Storage {
@@ -195,10 +197,10 @@ static int decode_account(const byte *account_bytes, size_t account_len,
 		if (pos >= account_len)
 			goto err_decoding;
 		size_t item_len = account_bytes[pos++];
-		if (pos + item_len > account_len || item_len > VALUE_LEN)
+		if (pos + item_len > account_len || item_len > BALANCE_LEN)
 			goto err_decoding;
 		if (item_len > 0)
-			memcpy(account->balance + (VALUE_LEN - item_len), account_bytes + pos, item_len);
+			memcpy(account->balance + (BALANCE_LEN - item_len), account_bytes + pos, item_len);
 		pos += item_len;
 	}
 	if (fieldset & 4) {
@@ -348,7 +350,7 @@ static void print_account(const struct Account *account)
 	       T_LABEL " balance=" T_RESET,
 	       (unsigned long long)account->incarnation,
 	       (unsigned long long)account->nonce);
-	print_number(account->balance, 0, VALUE_LEN);
+	print_number(account->balance, 0, BALANCE_LEN);
 	printf(T_RESET T_LABEL " codeHash=" T_RESET T_CODE);
 	if (0 == memcmp(account->codeHash, empty_code_hash, HASH_LEN)
 	    || 0 == memcmp(account->codeHash, zero_code_hash, HASH_LEN)) {
@@ -463,8 +465,11 @@ static int file_close(struct File *file, bool delete_file)
 struct Writer {
 	struct File *file;
 	bool have_block, have_address;
-	uint64_t block, block_delta_base, incarnation;
-	byte address[ADDRESS_LEN], slot[SLOT_LEN];
+	uint64_t block, nonce, account_incarnation, storage_incarnation;
+	byte address[ADDRESS_LEN];
+	byte balance[BALANCE_LEN];
+	byte code_hash[HASH_LEN];
+	byte slot[SLOT_LEN];
 	uint64_t count_accounts, count_slots;
 	int strategy;
 };
@@ -474,11 +479,13 @@ static void writer_init(struct Writer *writer, struct File *file)
 	writer->file = file;
 	writer->have_block = false;
 	writer->have_address = false;
-	writer->block = (uint64_t)-1;
-	writer->block_delta_base = 0;
-	writer->incarnation = 0;
-	memset(writer->address, 0, sizeof(writer->address));
-	memset(writer->slot, 0, sizeof(writer->slot));
+	writer->block = 0;
+	writer->account_incarnation = 0;
+	writer->storage_incarnation = 0;
+	memset(writer->address, 0, ADDRESS_LEN);
+	memset(writer->balance, 0, BALANCE_LEN);
+	memset(writer->code_hash, 0, HASH_LEN);
+	memset(writer->slot, 0, SLOT_LEN);
 	writer->count_accounts = 0;
 	writer->count_slots = 0;
 	writer->strategy = 0;
@@ -521,28 +528,45 @@ static void write_block_number(struct Writer *writer, uint64_t block)
 {
 	if (writer->have_block && block == writer->block)
 		return;
-	uint64_t delta = block - writer->block;
+	uint64_t delta_block = block - writer->block;
 	writer->have_block = true;
 	writer->block = block;
-
-	if (writer->strategy >= 1) {
-		//block -= writer->block_delta_base;
-		//writer->block_delta_base = writer->block;
-		block = delta;
-	}
 
 	if (PRINT)
 		print_block_number(block);
 
+	if (writer->strategy == 0)
+		delta_block = block;
+
 	byte bytes[8];
-	put64be(bytes, block);
+	put64be(bytes, delta_block);
 	size_t i;
 	for (i = 0; i < 7; i++)
 		if (bytes[i] != 0)
 			break;
-	putc(CODE_BLOCK_NUMBER + (7 - i), writer->file->file);
-	for (; i < 8; i++)
-		putc(bytes[i], writer->file->file);
+	if (i == 7 && bytes[7] <= 4) {
+		putc(CODE_BLOCK_INLINE + bytes[7], writer->file->file);
+	} else {
+		putc(CODE_BLOCK_NUMBER + (7 - i), writer->file->file);
+		for (; i < 8; i++)
+			putc(bytes[i], writer->file->file);
+	}
+}
+
+static void delta(byte *delta_out, const byte *value_in, byte *accumulator, size_t len)
+{
+	for (int i = len-1, borrow = 1; i >= 0; i--) {
+		int delta = (int)value_in[i] - (int)accumulator[i] - borrow;
+		accumulator[i] = value_in[i];
+		borrow = delta < 0;
+		delta_out[i] = (byte)delta;
+	}
+}
+
+static void invert(byte *bytes, size_t len)
+{
+	for (int i = 0; i < (int)len; i++)
+		bytes[i] = ~bytes[i];
 }
 
 static void write_address(struct Writer *writer, const byte address[ADDRESS_LEN])
@@ -550,6 +574,10 @@ static void write_address(struct Writer *writer, const byte address[ADDRESS_LEN]
 	if (writer->have_address
 	    && 0 == memcmp(address, writer->address, ADDRESS_LEN))
 		return;
+#if 0
+	byte delta_address[ADDRESS_LEN];
+	delta(delta_address, address, writer->address, ADDRESS_LEN);
+#endif
 	writer->have_address = true;
 	memcpy(writer->address, address, ADDRESS_LEN);
 
@@ -561,8 +589,14 @@ static void write_address(struct Writer *writer, const byte address[ADDRESS_LEN]
 
 	if (writer->strategy >= 1) {
 		/* New address resets some other compression values. */
-		writer->block_delta_base = 0;
+		writer->block = 0;
+		writer->nonce = 0;
+		memset(writer->balance, 0, BALANCE_LEN);
+		memset(writer->code_hash, 0, HASH_LEN);
 	}
+	/* `write_storage` uses incarnation reference with strategy == 0 too. */
+	writer->account_incarnation = 0;
+	writer->storage_incarnation = 0;
 }
 
 static void write_account(struct Writer *writer, const struct Account *account)
@@ -572,34 +606,121 @@ static void write_account(struct Writer *writer, const struct Account *account)
 	if (PRINT)
 		print_account(account);
 
+	/* Nonce delta encoding alone saves ~1.5% of storage. */
+	uint64_t encoded_nonce, encoded_incarnation;
+	if (writer->strategy == 0) {
+		encoded_nonce = account->nonce;
+		encoded_incarnation = account->incarnation;
+	} else {
+		encoded_nonce = account->nonce - writer->nonce;
+		encoded_incarnation = account->incarnation - writer->account_incarnation;
+		if (encoded_incarnation >= 3)
+			abort();
+		writer->nonce = account->nonce;
+	}
+	/* `write_storage` uses incarnation reference with strategy == 0 too. */
+	writer->account_incarnation = account->incarnation;
+	writer->storage_incarnation = account->incarnation;
+
 	byte flags = 0;
+
+	byte encoded_balance[BALANCE_LEN];
+	if (writer->strategy == 0) {
+		memcpy(encoded_balance, account->balance, BALANCE_LEN);
+	} else {
+		delta(encoded_balance, account->balance, writer->balance, BALANCE_LEN);
+		if (encoded_balance[0] >= (byte)0x80) {
+			invert(encoded_balance, BALANCE_LEN);
+			flags |= (1 << 5);
+		}
+	}
+
 	if (0 != memcmp(account->balance, zero_balance, VALUE_LEN))
 		flags |= 1;
 	if (0 != memcmp(account->codeHash, zero_code_hash, HASH_LEN)
 	    && 0 != memcmp(account->codeHash, empty_code_hash, HASH_LEN)) {
 		flags |= 2;
 	}
-	if (account->nonce >= 3)
+
+	const byte *encoded_code_hash = (flags & 2) ? account->codeHash : zero_code_hash;
+	/*
+	 * At block 10094566, there is a self-destruct, create, sstore on
+	 * account 000000000000006f6502b7f2bbac8c30a3f67e9a.  It has the effect
+	 * of pairing an inc=1 account entry (from before the self-destruct)
+	 * with inc=2 storage entries (from before the sstore).  Later at block
+	 * 10094587, the balance changes which adds the inc=2 account entry for
+	 * the create at 10094566.  The sequence when address is the primary
+	 * order, and account/state updates as at last-block-number:
+	 *
+	 * (set block=10094566)
+	 * Account block=10094566 address=000000000000006f6502b7f2bbac8c30a3f67e9a
+	 *         inc=1 nonce=1976 balance=1 codeHash=a81d7f06c942f28e7852465c195e233d05e645893ae829822e95b4ff420d93c2
+	 * Storage block=10094566 slot=000000000000006f6502b7f2bbac8c30a3f67e9a/0000000000000000000000000000000000000000000000000000000000005850
+	 *         inc=2 value=0
+	 * Storage block=10094566 slot=000000000000006f6502b7f2bbac8c30a3f67e9a/0000000000000000000000003452954838762313786992245132387393331546
+	 *         inc=2 value=0
+	 * (set block=10094587)
+	 * Account block=10094587 address=000000000000006f6502b7f2bbac8c30a3f67e9a
+	 *         inc=2 nonce=1 balance=1 codeHash=b06895d1ddccd23a5648db366bf46ecaf7e60d6364a7974e8785d9eb5f04cc18
+	 *
+	 * Due to this sequence, simply delta-compressing inc results in zero
+	 * delta for the second account entry, which doesn't match the encoding
+	 * constraint that codeHash only changes when there is delta inc.  To
+	 * maintain the constraint, delta-compression of account inc is done
+	 * relative to the previous account inc.  This problem goes away when
+	 * we change all account/state updates to Nimbus first-block-number
+	 * order, and constrain storage inc ranges correctly.  But that is only
+	 * possible after merging the transposed state files.
+	 */
+	if (encoded_incarnation == 0 && writer->strategy >= 1) {
+		if (0 != memcmp(writer->code_hash, encoded_code_hash, HASH_LEN)) {
+			fprintf(stderr, "Change of code hash with no change of incarnation\n");
+			print_account(account);
+			abort();
+		}
+		flags &= ~2;
+	} else {
+		memcpy(writer->code_hash, encoded_code_hash, HASH_LEN);
+	}
+
+	if (encoded_nonce >= 3)
 		flags |= (3 << 2);
 	else
-		flags |= (byte)account->nonce << 2;
-	if (account->incarnation >= 3)
-		flags |= (3 << 4);
-	else
-		flags |= (byte)account->incarnation << 4;
+		flags |= (byte)encoded_nonce << 2;
+
+	if (writer->strategy == 0) {
+		if (encoded_incarnation >= 3)
+			flags |= (3 << 4);
+		else
+			flags |= (byte)encoded_incarnation << 4;
+	} else {
+		/*
+		 * In account entries, in the block ranges measured (blocks
+		 * 10-10.1M), `encoded_incarnation` was 0 in 99.865% of
+		 * entries, 1 in 0.135% of entries, and never >= 2.  It is
+		 * rare, so there is no need for efficient inline encoding of
+		 * >= 2, but it must be supported because multiple
+		 * self-destruct+create pairs are allowed in the same block.
+		 */
+		if (encoded_incarnation == 1) {
+			flags |= (1 << 4);
+		} else if (encoded_incarnation != 0) {
+			putc(CODE_INCARNATION, writer->file->file);
+			write_u64(writer, encoded_incarnation);
+		}
+	}
 
 	putc(CODE_ACCOUNT + flags, writer->file->file);
 	if (flags & 1)
-		write_number(writer, account->balance, VALUE_LEN);
+		write_number(writer, encoded_balance, VALUE_LEN);
 	if (flags & 2)
 		write_array(writer, account->codeHash, HASH_LEN);
 	if ((flags & (3 << 2)) == (3 << 2))
-		write_u64(writer, account->nonce);
+		write_u64(writer, encoded_nonce);
+#if 1
 	if ((flags & (3 << 4)) == (3 << 4))
-		write_u64(writer, account->incarnation);
-
-	if (account->incarnation != 0)
-		writer->incarnation = account->incarnation;
+		write_u64(writer, encoded_incarnation);
+#endif
 }
 
 static void write_storage(struct Writer *writer, const struct Storage *storage)
@@ -609,62 +730,69 @@ static void write_storage(struct Writer *writer, const struct Storage *storage)
 	if (PRINT)
 		print_storage(storage);
 
-	byte flags = 0, delta_slot[SLOT_LEN];
-	int slot_bytes, delta_bytes, value_bytes, invert_bytes;
-	const byte *slot = &storage->slot[0];
-	const byte *value = &storage->value[0];
-	size_t value_len = sizeof(storage->value);
-
-	if (storage->incarnation != writer->incarnation) {
-		uint64_t incarnation = storage->incarnation;
-		writer->incarnation = incarnation;
-		if (incarnation >= 1 && incarnation <= 4) {
-			putc(CODE_INCARNATION + (incarnation - 1), writer->file->file);
-		} else {
-			putc(CODE_INCARNATION + 4, writer->file->file);
-			write_u64(writer, incarnation);
+	/*
+	 * Because storage incarnation must be >= 1, if
+	 * writer->storage_incarnation == 0, treat it as 1 for delta purposes.
+	 */
+	uint64_t base_incarnation = writer->storage_incarnation;
+	if (base_incarnation == 0)
+		base_incarnation = 1;
+	/*
+	 * In storage entries, in the block ranges measured (blocks 10-10.1M),
+	 * non-zero `encoded_incarnation` here was extremely rare, just 1 in
+	 * 55M (0.0000018%).  This is much rarer than in account entries
+	 * because storage is usually preceded by an account entry with the
+	 * same incarnation.  So there is no need for efficient encoding of
+	 * non-zero values, but it must be supported because
+	 * self-destruct+create+sstore sequences can occur the same block.
+	 */
+	if (storage->incarnation != base_incarnation) {
+		if (storage->incarnation < base_incarnation) {
+			if (storage->incarnation == 0)
+				fprintf(stderr, "Error: Storage with incarnation == 0\n");
+			else
+				fprintf(stderr, "Error: Storage with same-address incarnation decreasing\n");
+			print_storage(storage);
+			exit(EXIT_FAILURE);
 		}
+		uint64_t encoded_incarnation = storage->incarnation - base_incarnation;
+		writer->storage_incarnation = storage->incarnation;
+		putc(CODE_INCARNATION, writer->file->file);
+		write_u64(writer, encoded_incarnation);
 	}
 
-	/* Calculate the delta in slot address, minus 1.. */
-	for (int i = SLOT_LEN-1, borrow = 1; i >= 0; i--) {
-		int delta = (int)slot[i] - (int)writer->slot[i] - borrow;
-		writer->slot[i] = slot[i];
-		borrow = delta < 0;
-		delta_slot[i] = (byte)delta;
-	}
+	byte flags = 0;
 
-	/* Figure out whether the slot address or delta uses fewer bytes. */
+	/* Calculate the delta in slot key, minus 1. */
+	byte delta_slot[SLOT_LEN];
+	delta(delta_slot, storage->slot, writer->slot, SLOT_LEN);
+
+	/* Figure out whether the slot key or delta uses fewer bytes. */
+	int slot_bytes, delta_bytes;
 	for (slot_bytes = SLOT_LEN; slot_bytes > 0; slot_bytes--)
-		if (slot[SLOT_LEN - slot_bytes] != 0)
+		if (storage->slot[SLOT_LEN - slot_bytes] != 0)
 			break;
 	for (delta_bytes = SLOT_LEN; delta_bytes > 0; delta_bytes--)
 		if (delta_slot[SLOT_LEN - delta_bytes] != 0)
 			break;
-	if (slot_bytes != 1 || slot[SLOT_LEN-1] >= 224)
+	if (slot_bytes != 1 || storage->slot[SLOT_LEN-1] >= 224)
 		slot_bytes++;
 	if (delta_bytes != 1 || delta_slot[SLOT_LEN-1] >= 224)
 		delta_bytes++;
-	/* Switch to using the delta if it's strictly shorter. */
-	if (delta_bytes < slot_bytes) {
+
+	/*
+	 * Switch to using the delta if it's strictly shorter.  In the block
+	 * ranges measured (blocks 10-10.1M), having the choice uses about
+	 * 30.6% less space compared with always using delta encoding here.
+	 */
+	const byte *slot = &storage->slot[0];
+	if (1 || delta_bytes < slot_bytes) {
 		slot = delta_slot;
 		slot_bytes = delta_bytes;
 		flags |= (1 << 3);
 	}
 
-	/* Figure out whether the value or its inverse uses fewer bytes. */
-	for (value_bytes = VALUE_LEN; value_bytes > 0; value_bytes--)
-		if (value[VALUE_LEN - value_bytes] != 0)
-			break;
-	for (invert_bytes = VALUE_LEN; invert_bytes > 0; invert_bytes--)
-		if (value[VALUE_LEN - invert_bytes] != 0xff)
-			break;
-	if (value_bytes != 1 || value[VALUE_LEN-1] >= 224)
-		value_bytes++;
-	if (invert_bytes != 1 || value[VALUE_LEN-1] <= (224 ^ 0xff))
-		invert_bytes++;
-
-	/* Set the slot encoding bits in the first byte. */
+	/* Set the slot key encoding bits in the first byte. */
 	if (slot_bytes == 1 && slot[SLOT_LEN-1] < 9)
 		flags |= (slot[SLOT_LEN-1] << 4);
 	else if (slot_bytes < 33)
@@ -672,13 +800,25 @@ static void write_storage(struct Writer *writer, const struct Storage *storage)
 	else
 		flags |= (10 << 4);
 
-	/* Set the value encoding bits in the first byte. */
-	if (invert_bytes < value_bytes)
+	/*
+	 * Set the value encoding bits in the first byte, and figure
+	 * out whether the value or its inverse uses fewer bytes.
+	 */
+	byte encoded_value[VALUE_LEN];
+	memcpy(encoded_value, storage->value, VALUE_LEN);
+	if (encoded_value[0] >= (byte)0x80) {
+		invert(encoded_value, VALUE_LEN);
 		flags |= (6 << 0);
-	else if (value_bytes == 1 && value[VALUE_LEN-1] < 6)
-		flags |= (value[VALUE_LEN-1] << 0);
-	else
-		flags |= (7 << 0);
+	} else {
+		int value_bytes;
+		for (value_bytes = VALUE_LEN; value_bytes > 0; value_bytes--)
+			if (encoded_value[VALUE_LEN - value_bytes] != 0)
+				break;
+		if (value_bytes <= 1 && encoded_value[VALUE_LEN-1] < 6)
+			flags |= (encoded_value[VALUE_LEN-1] << 0);
+		else
+			flags |= (7 << 0);
+	}
 
 	/* Output the first byte, optional slot or delta, optional value or inverse. */
 	putc(CODE_STORAGE + flags, writer->file->file);
@@ -688,14 +828,8 @@ static void write_storage(struct Writer *writer, const struct Storage *storage)
 	else if ((byte)(flags >> 4) == 10)
 		write_array(writer, slot, SLOT_LEN);
 
-	if (invert_bytes < value_bytes) {
-		byte invert_value[VALUE_LEN];
-		for (int i = 0; i < VALUE_LEN; i++)
-			invert_value[i] = (byte)(~value[i]);
-		write_number(writer, invert_value, VALUE_LEN);
-	} else if ((flags & (7 << 0)) == (7 << 0)) {
-		write_number(writer, value, VALUE_LEN);
-	}
+	if ((flags & (7 << 0)) >= (6 << 0))
+		write_number(writer, encoded_value, VALUE_LEN);
 }
 
 /*
@@ -778,7 +912,7 @@ static int db_extract_blockrange(MDBX_env *env, MDBX_txn *txn,
 		goto err_dbi_codeHash;
 	}
 
-	struct File *file = file_open(true, "./data/blocks-%llu-%llu.dat",
+	struct File *file = file_open(true, "./data/blocks-x-%llu-%llu.dat",
 				      (unsigned long long)block_start,
 				      (unsigned long long)(block_end - 1));
 	if (!file) {
@@ -1282,6 +1416,10 @@ static int transpose_sort_order(const void *arg1, const void *arg2)
 	struct ReaderItem *item1 = *(struct ReaderItem **)arg1;
 	struct ReaderItem *item2 = *(struct ReaderItem **)arg2;
 	int cmp = memcmp(item1->address, item2->address, ADDRESS_LEN);
+	if (cmp == 0) {
+		cmp = (item1->block < item2->block ? -1
+		       : item1->block > item2->block ? +1 : 0);
+	}
 	if (1 && cmp == 0 && (item1->is_storage || item2->is_storage)) {
 		if (!item1->is_storage)
 			cmp = -1;
@@ -1292,10 +1430,6 @@ static int transpose_sort_order(const void *arg1, const void *arg2)
 			struct Storage *storage2 = (struct Storage *)item2;
 			cmp = memcmp(storage1->slot, storage2->slot, SLOT_LEN);
 		}
-	}
-	if (cmp == 0) {
-		cmp = (item1->block < item2->block ? -1
-		       : item1->block > item2->block ? +1 : 0);
 	}
 	return cmp;
 }
@@ -1349,6 +1483,7 @@ static int transpose_blockrange(uint64_t block_start, uint64_t block_end)
 	if (user_break)
 		goto done;
 
+	fprintf(stderr, "Sorting in transpose_blockrange file_in=%s\n", file_in->name);
 	qsort(vector_data, vector_len, sizeof(*vector_data), transpose_sort_order);
 
 	file_out = file_open(true, "./data/transposed-%llu-%llu.dat",
@@ -1364,8 +1499,9 @@ static int transpose_blockrange(uint64_t block_start, uint64_t block_end)
 
 	for (size_t i = 0; i < vector_len && !user_break; i++) {
 		struct ReaderItem *item = vector_data[i];
-		write_block_number(&writer, item->block);
+		/* Write address first, so all block deltas work including the first. */
 		write_address(&writer, item->address);
+		write_block_number(&writer, item->block);
 		if (!item->is_storage)
 			write_account(&writer, (const struct Account *)item);
 		else
@@ -1611,9 +1747,10 @@ int main(int argc, char *argv[]) {
 	//rc = transpose_blockrange(100000, 200000);
 	//rc = show_file("./data/blocks-100000-199999.dat");
 	//rc = show_file("./data/transposed-100000-199999.dat");
-	//rc = transpose_blockrange(10000000, 10100000);
+	//rc = db_extract_blockrange(env, txn, 10094500, 10100000);
+	rc = transpose_blockrange(10000000, 10100000);
 	//rc = show_file("./data/blocks-10000000-10099999.dat");
-	rc = show_file("./data/transposed-10000000-10099999.dat");
+	//rc = show_file("./data/transposed-10000000-10099999.dat");
 
 	if (rc == MDBX_NOTFOUND)
 		rc = MDBX_SUCCESS;

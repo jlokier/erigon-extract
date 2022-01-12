@@ -21,13 +21,19 @@
 #endif                          /* _MSC_VER (warnings) */
 
 #define xMDBX_TOOLS /* Avoid using internal mdbx_assert() */
-#include "internals.h"
+//#include "internals.h"
+#include "mdbx.h"
 
 #include <ctype.h>
 #include <stdarg.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 #if defined(_WIN32) || defined(_WIN64)
-#include "wingetopt.h"
+#include "libmdbx/src/wingetopt.h"
 
 static volatile BOOL user_break;
 static BOOL WINAPI ConsoleBreakHandlerRoutine(DWORD dwCtrlType) {
@@ -439,7 +445,7 @@ static struct File *file_open(bool for_write, const char *format, ...)
 static int file_close(struct File *file, bool delete_file)
 {
 	if (!file)
-		return;
+		return 0;
 	if (delete_file)
 		unlink(file->name);
 	if (ferror(file->file)) {
@@ -1563,7 +1569,7 @@ static void *db_extract_blockrange_thread(void *arg)
 {
 	struct db_extract_blockrange_job *job = arg;
 	MDBX_txn *txn;
-	int rc = mdbx_txn_begin(job->env, nullptr, MDBX_TXN_RDONLY, &txn);
+	int rc = mdbx_txn_begin(job->env, NULL, MDBX_TXN_RDONLY, &txn);
 	if (rc != MDBX_SUCCESS) {
 		error("mdbx_txn_begin", rc);
 	} else {
@@ -1593,6 +1599,7 @@ static int db_extract_blockrange_multithread(MDBX_env *env, MDBX_txn *txn,
 		pthread_create(&job->thread, NULL, db_extract_blockrange_thread, job);
 	}
 	printf("THREADS DONE\n");
+	return MDBX_SUCCESS;
 }
 
 static void usage(void) {
@@ -1638,23 +1645,22 @@ int main(int argc, char *argv[]) {
 		case 'V':
 			printf("mdbx_dump version %d.%d.%d.%d\n"
 			       " - source: %s %s, commit %s, tree %s\n"
-			       " - anchor: %s\n"
 			       " - build: %s for %s by %s\n"
 			       " - flags: %s\n"
 			       " - options: %s\n",
 			       mdbx_version.major, mdbx_version.minor, mdbx_version.release,
 			       mdbx_version.revision, mdbx_version.git.describe,
 			       mdbx_version.git.datetime, mdbx_version.git.commit,
-			       mdbx_version.git.tree, mdbx_sourcery_anchor, mdbx_build.datetime,
+			       mdbx_version.git.tree, mdbx_build.datetime,
 			       mdbx_build.target, mdbx_build.compiler, mdbx_build.flags,
 			       mdbx_build.options);
 			return EXIT_SUCCESS;
 		case 'l':
 			list = true;
 			/*FALLTHROUGH*/;
-			__fallthrough;
+			//__fallthrough;
 		case 'f':
-			if (freopen(optarg, "w", stdout) == nullptr) {
+			if (freopen(optarg, "w", stdout) == NULL) {
 				fprintf(stderr, "%s: %s: reopen: %s\n", prog, optarg,
 					mdbx_strerror(errno));
 				exit(EXIT_FAILURE);
@@ -1691,7 +1697,7 @@ int main(int argc, char *argv[]) {
 		fprintf(stderr, "mdbx_dump %s (%s, T-%s)\nRunning for %s...\n",
 			mdbx_version.git.describe, mdbx_version.git.datetime,
 			mdbx_version.git.tree, envname);
-		fflush(nullptr);
+		fflush(NULL);
 	}
 
 	rc = mdbx_env_create(&env);
@@ -1723,7 +1729,7 @@ int main(int argc, char *argv[]) {
 		goto env_close;
 	}
 
-	rc = mdbx_txn_begin(env, nullptr, MDBX_TXN_RDONLY, &txn);
+	rc = mdbx_txn_begin(env, NULL, MDBX_TXN_RDONLY, &txn);
 	if (rc != MDBX_SUCCESS) {
 		error("mdbx_txn_begin", rc);
 		goto env_close;

@@ -884,8 +884,8 @@ err:
  * effect, so this is not a correct extraction of the account/storage history.
  * But it is about the same size, so good for exercising Nimbus.
  */
-static int db_extract_blockrange(MDBX_env *env, MDBX_txn *txn,
-				 uint64_t block_start, uint64_t block_end)
+static int extract_blockrange(MDBX_env *env, MDBX_txn *txn,
+			      uint64_t block_start, uint64_t block_end)
 {
 	int rc;
 	MDBX_dbi dbi_accountCs, dbi_storageCs, dbi_codeHash;
@@ -925,7 +925,7 @@ static int db_extract_blockrange(MDBX_env *env, MDBX_txn *txn,
 		rc = MDBX_EIO;
 		goto err;
 	}
-	fprintf(stderr, "Starting db_extract_blockrange file=%s\n", file->name);
+	fprintf(stderr, "Starting extract_blockrange file=%s\n", file->name);
 
 	struct Writer writer;
 	writer_init(&writer, file);
@@ -945,24 +945,24 @@ static int db_extract_blockrange(MDBX_env *env, MDBX_txn *txn,
 		}
 		if (!have_account && !done_accounts) {
 			rc = mdbx_cursor_get(cursor_accountCs, &key_account, &data_account,
-					     first_item ? MDBX_SET_RANGE: MDBX_NEXT);
-			if (rc == MDBX_SUCCESS)
+					     first_item ? MDBX_SET_RANGE : MDBX_NEXT);
+			if (rc == MDBX_SUCCESS) {
 				have_account = true;
-			else if (rc == MDBX_NOTFOUND)
+			} else if (rc == MDBX_NOTFOUND) {
 				done_accounts = true;
-			else {
+			} else {
 				error("mdbx_cursor_get AccountChangeSet", rc);
 				goto err;
 			}
 		}
 		if (!have_storage && !done_storage) {
 			rc = mdbx_cursor_get(cursor_storageCs, &key_storage, &data_storage,
-					     first_item ? MDBX_SET_RANGE: MDBX_NEXT);
-			if (rc == MDBX_SUCCESS)
+					     first_item ? MDBX_SET_RANGE : MDBX_NEXT);
+			if (rc == MDBX_SUCCESS) {
 				have_storage = true;
-			else if (rc == MDBX_NOTFOUND)
+			} else if (rc == MDBX_NOTFOUND) {
 				done_storage = true;
-			else {
+			} else {
 				error("mdbx_cursor_get StorageChangeSet", rc);
 				goto err;
 			}
@@ -1037,7 +1037,7 @@ static int db_extract_blockrange(MDBX_env *env, MDBX_txn *txn,
 		}
 	}
 
-	fprintf(stderr, "Finished db_extract_blockrange file=%s accounts=%llu slots=%llu\n",
+	fprintf(stderr, "Finished extract_blockrange file=%s accounts=%llu slots=%llu\n",
 		file->name, (unsigned long long)writer.count_accounts,
 		(unsigned long long)writer.count_slots);
 	rc = MDBX_SUCCESS;
@@ -1056,14 +1056,14 @@ err_dbi_accountCs:
 }
 
 /*
- * Dump the "PlainState" data, which contains account and storage values for
+ * Extract the "PlainState" data, which contains account and storage values for
  * `block`.
  *
  * Note: If this might run concurrently with Erigon, the block number _must_
  * be the value from the "SyncStage" table, key "Execution", _in the same
  * transaction (`txn`)_ as "PlainState" is read, otherwise the data is invalid.
  */
-static int dump_plainstate(MDBX_env *env, MDBX_txn *txn, uint64_t block)
+static int extract_plainstate(MDBX_env *env, MDBX_txn *txn, uint64_t block)
 {
 	int rc;
 	MDBX_dbi dbi_plainState, dbi_codeHash;
@@ -1092,7 +1092,7 @@ static int dump_plainstate(MDBX_env *env, MDBX_txn *txn, uint64_t block)
 		rc = MDBX_EIO;
 		goto err;
 	}
-	fprintf(stderr, "Starting dump_plainstate file=%s\n", file->name);
+	fprintf(stderr, "Starting extract_plainstate file=%s\n", file->name);
 
 	struct Writer writer;
 	writer_init(&writer, file);
@@ -1102,11 +1102,11 @@ static int dump_plainstate(MDBX_env *env, MDBX_txn *txn, uint64_t block)
 	while (!user_break) {
 		rc = mdbx_cursor_get(cursor_plainState, &key_plainState, &data_plainState,
 				     first_time ? MDBX_FIRST : MDBX_NEXT);
-		if (rc == MDBX_SUCCESS)
+		if (rc == MDBX_SUCCESS) {
 			first_time = false;
-		else if (rc == MDBX_NOTFOUND)
+		} else if (rc == MDBX_NOTFOUND) {
 			break;
-		else {
+		} else {
 			error("mdbx_cursor_get PlainState", rc);
 			goto err;
 		}
@@ -1160,7 +1160,7 @@ static int dump_plainstate(MDBX_env *env, MDBX_txn *txn, uint64_t block)
 		}
 	}
 
-	fprintf(stderr, "Finished dump_plainstate file=%s accounts=%llu slots=%llu\n",
+	fprintf(stderr, "Finished extract_plainstate file=%s accounts=%llu slots=%llu\n",
 		file->name, (unsigned long long)writer.count_accounts,
 		(unsigned long long)writer.count_slots);
 	rc = MDBX_SUCCESS;
@@ -1348,7 +1348,7 @@ static int read_item(struct Reader *reader, bool print, struct ReaderItem **item
 						storage->value[i] = (byte)(~storage->value[i]);
 				}
 			}
-				
+
 			if (feof(file) || ferror(file))
 				goto err_file;
 			if (print)
@@ -1512,7 +1512,7 @@ static int transpose_blockrange(uint64_t block_start, uint64_t block_end)
 			write_account(&writer, (const struct Account *)item);
 		else
 			write_storage(&writer, (const struct Storage *)item);
-	}	
+	}
 
 done:
 	rc = MDBX_SUCCESS;
@@ -1533,10 +1533,13 @@ err_file:
 	goto err;
 }
 
-struct db_extract_blockrange_job {
+struct Job {
 	pthread_t thread;
-	uint64_t block_start, block_end;
+	uint64_t range_start, range_end;
 	MDBX_env *env;
+	MDBX_txn *txn;
+	int (*fn)(MDBX_env *env, MDBX_txn *txn,
+		  uint64_t range_start, uint64_t range_end);
 };
 
 static pthread_mutex_t jobs_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -1565,41 +1568,57 @@ static void jobs_wait_finish(void)
 	job_allocate(1);
 }
 
-static void *db_extract_blockrange_thread(void *arg)
+static void *job_run(void *arg)
 {
-	struct db_extract_blockrange_job *job = arg;
-	MDBX_txn *txn;
-	int rc = mdbx_txn_begin(job->env, NULL, MDBX_TXN_RDONLY, &txn);
-	if (rc != MDBX_SUCCESS) {
-		error("mdbx_txn_begin", rc);
+	struct Job *job = arg;
+	MDBX_txn *txn = job->txn;
+	if (txn != NULL) {
+		job->fn(job->env, txn, job->range_start, job->range_end);
 	} else {
-		db_extract_blockrange(job->env, txn, job->block_start, job->block_end);
-		mdbx_txn_abort(txn);
+		int rc = mdbx_txn_begin(job->env, NULL, MDBX_TXN_RDONLY, &txn);
+		if (rc != MDBX_SUCCESS) {
+			error("mdbx_txn_begin", rc);
+		} else {
+			job->fn(job->env, txn, job->range_start, job->range_end);
+			mdbx_txn_abort(txn);
+		}
 	}
 	job_completed();
 	free(job);
 	return NULL;
 }
 
-static int db_extract_blockrange_multithread(MDBX_env *env, MDBX_txn *txn,
-					     uint64_t block_start, uint64_t block_end)
+static int jobs_run_multithread(MDBX_env *env, MDBX_txn *txn_only_if_shared,
+				uint64_t range_start, uint64_t range_end,
+				uint64_t range_step, int max_concurrent,
+				int (*fn)(MDBX_env *env, MDBX_txn *txn,
+					  uint64_t range_start,
+					  uint64_t range_end))
 {
-	while (!user_break && block_start < block_end) {
-		job_allocate(64);
+	while (!user_break && range_start < range_end) {
+		job_allocate(max_concurrent);
 
-		uint64_t end = block_start + 100000;
-		if (end > block_end)
-			end = block_end;
+		uint64_t end = range_start + range_step;
+		if (end > range_end)
+			end = range_end;
 
-		struct db_extract_blockrange_job *job = malloc(sizeof(*job));
-		job->block_start = block_start;
-		job->block_end = end;
-		block_start = end;
+		struct Job *job = malloc(sizeof(*job));
+		job->range_start = range_start;
+		job->range_end = end;
+		range_start = end;
 		job->env = env;
-		pthread_create(&job->thread, NULL, db_extract_blockrange_thread, job);
+		job->txn = txn_only_if_shared;
+		job->fn = fn;
+		pthread_create(&job->thread, NULL, job_run, job);
 	}
-	printf("THREADS DONE\n");
 	return MDBX_SUCCESS;
+}
+
+static int extract_blockrange_multithread(MDBX_env *env, MDBX_txn *txn,
+					  uint64_t block_start, uint64_t block_end)
+{
+	return jobs_run_multithread(env, NULL, block_start, block_end,
+				    100000, 64, extract_blockrange);
 }
 
 static void usage(void) {
@@ -1741,20 +1760,20 @@ int main(int argc, char *argv[]) {
 		goto txn_abort;
 	printf("Reading block range 0 to %llu\n", (unsigned long long)latest_block);
 
-	//rc = db_extract_blockrange(env, txn, 13520000, 14005000);
-//	rc = db_extract_blockrange(env, txn, 5000000, 13807650);
-	//rc = db_extract_blockrange_multithread(env, txn, 8000000, 8300000);
-	//rc = db_extract_blockrange_multithread(env, txn, 13000000, 13100000);
-	//rc = db_extract_blockrange_multithread(env, txn, 13800000, latest_block);
-	//rc = db_extract_blockrange_multithread(env, txn, 0, latest_block);
-	//rc = dump_plainstate(env, txn, latest_block);
+	//rc = extract_blockrange(env, txn, 13520000, 14005000);
+//	rc = extract_blockrange(env, txn, 5000000, 13807650);
+	//rc = extract_blockrange_multithread(env, txn, 8000000, 8300000);
+	//rc = extract_blockrange_multithread(env, txn, 13000000, 13100000);
+	//rc = extract_blockrange_multithread(env, txn, 13800000, latest_block);
+	//rc = extract_blockrange_multithread(env, txn, 0, latest_block);
+	//rc = extract_plainstate(env, txn, latest_block);
 	//rc = show_file("./data/blocks-plainstate-13818907.dat", true);
 	//rc = show_file("./data/blocks-13800000-13818906.dat", true);
 	//rc = transpose_blockrange(100000, 200000);
 	//rc = show_file("./data/blocks-100000-199999.dat");
 	//rc = show_file("./data/transposed-100000-199999.dat");
-	//rc = db_extract_blockrange(env, txn, 10094500, 10100000);
-	rc = transpose_blockrange(10000000, 10100000);
+	//rc = extract_blockrange(env, txn, 10094500, 10100000);
+	//rc = transpose_blockrange(10000000, 10100000);
 	//rc = show_file("./data/blocks-10000000-10099999.dat");
 	//rc = show_file("./data/transposed-10000000-10099999.dat");
 

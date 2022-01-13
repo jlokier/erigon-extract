@@ -1175,6 +1175,232 @@ err_dbi_plainState:
 	return rc;
 }
 
+/*
+ * Extract all the block bodies, which are mainly transactions, and a few bytes
+ * of uncle data.
+ *
+ * This version extracts duplicate block numbers (with different hashes) if
+ * they are present, rather than filtering to the canonical chain blocks.
+ * Duplicate blocks numbers appear in clusters surprisingly far in the past.
+ * Those are not useful, and incorrect if the reader is assuming these blocks
+ * form a single chain, so the non-canonical blocks should be filtered out.
+ *
+ * These are called `txbodies` because they are almost entirely transactions,
+ * and `txbodies` is visually distinct and easier to do file name completion
+ * with than `blocks`, when used alongside other files also called `blocks`.
+ */
+static int extract_txbodies(MDBX_env *v, MDBX_txn *txn,
+			    uint64_t block_start, uint64_t block_end)
+{
+	int rc;
+	MDBX_dbi dbi_blockBody, dbi_blockTransaction;
+	MDBX_cursor *cursor_blockBody, *cursor_blockTransaction;
+	MDBX_val key_blockBody, data_blockBody;
+
+	rc = mdbx_dbi_open(txn, "BlockBody", MDBX_ACCEDE, &dbi_blockBody);
+	if (rc != MDBX_SUCCESS) {
+		error("mdbx_dbi_open BlockBody", rc);
+		goto err_dbi_blockBody;
+	}
+	rc = mdbx_cursor_open(txn, dbi_blockBody, &cursor_blockBody);
+	if (rc != MDBX_SUCCESS) {
+		error("mdbx_cursor_open BlockBody", rc);
+		goto err_cursor_blockBody;
+	}
+	rc = mdbx_dbi_open(txn, "BlockTransaction", MDBX_ACCEDE, &dbi_blockTransaction);
+	if (rc != MDBX_SUCCESS) {
+		error("mdbx_dbi_open BlockTransaction", rc);
+		goto err_dbi_blockTransaction;
+	}
+	rc = mdbx_cursor_open(txn, dbi_blockTransaction, &cursor_blockTransaction);
+	if (rc != MDBX_SUCCESS) {
+		error("mdbx_cursor_open BlockTransaction", rc);
+		goto err_cursor_blockTransaction;
+	}
+
+	struct File *file = file_open(true, "./data/txbodies-%llu-%llu.dat",
+				      (unsigned long long)block_start,
+				      (unsigned long long)block_end);
+	if (!file) {
+		rc = MDBX_EIO;
+		goto err;
+	}
+	fprintf(stderr, "Starting extract_txbodies file=%s\n", file->name);
+
+	struct Writer writer;
+	writer_init(&writer, file);
+
+	bool first_time = true;
+	uint64_t block_count = 0, tx_count = 0, total_size = 0;
+	uint64_t block_expected = block_start, block_dups = 0;
+
+	while (!user_break) {
+		uint64_t key_block_be;
+		if (first_time) {
+			put64be((byte *)&key_block_be, block_start);
+			key_blockBody.iov_base = (void *)&key_block_be;
+			key_blockBody.iov_len = 8;
+		}
+		rc = mdbx_cursor_get(cursor_blockBody,
+				     &key_blockBody, &data_blockBody,
+				     first_time ? MDBX_SET_RANGE : MDBX_NEXT);
+		if (rc != MDBX_SUCCESS) {
+			if (rc == MDBX_NOTFOUND)
+				break;
+			error("mdbx_cursor_get BlockBody", rc);
+			goto err;
+		}
+		first_time = false;
+
+		if (key_blockBody.iov_len != 8 + 32) {
+			fprintf(stderr, "BlockBody key len != 8 + 32\n");
+			print_mdbx_val(&key_blockBody);
+			print_mdbx_val(&data_blockBody);
+			rc = MDBX_INVALID;
+			goto err;
+		}
+
+		uint64_t block = get64be((const byte *)key_blockBody.iov_base);
+		if (block >= block_end)
+			break;
+		if (block != block_expected) {
+			if (block_expected != block_start
+			    && block == block_expected - 1) {
+				/*
+				 * Duplicate block numbers with different
+				 * hashes occur in the data, surprisingly far
+				 * into the past.
+				 */
+				block_expected -= 1;
+				block_dups++;
+			} else {
+				fprintf(stderr, "BlockBody next block %llu != expected %llu\n",
+					(unsigned long long)block,
+					(unsigned long long)(block_start + block_count));
+				rc = MDBX_INVALID;
+				goto err;
+			}
+		}
+		block_expected++;
+		block_count++;
+
+		uint64_t tx_index, tx_amount;
+
+		/*
+		 * The `BlockBody` entry is an RLP encoded list: [tx_index,
+		 * tx_amount, [uncles]].  We won't parse the RLP carefully, or
+		 * even correctly.  In particular there are no bounds checks
+		 * here.  Just extract what we need, assuming it is correct.
+		 */
+		const byte *rlp_base = (const byte *)data_blockBody.iov_base;
+		const byte *rlp = rlp_base;
+		size_t rlp_len = data_blockBody.iov_len;
+		if (rlp_len < 4)
+			goto err_syntax_blockBody;
+
+		/* Decode RLP list header. */
+		if (*rlp < 0xc3)
+			goto err_syntax_blockBody;
+		size_t list_len = *rlp - 0xc0;
+		if (*rlp >= 0xf8) {
+			size_t len_len = *rlp - 0xf7;
+			list_len = 0;
+			while (len_len-- > 0)
+				list_len = (list_len << 8) | *++rlp;
+		}
+		rlp++;
+
+		/* Decode RLP tx_index number. */
+		if (*rlp <= 0x7f) {
+			tx_index = *rlp;
+		} else if (*rlp > 0x88) {
+			goto err_syntax_blockBody;
+		} else {
+			size_t num_len = *rlp - 0x80;
+			tx_index = 0;
+			while (num_len-- > 0)
+				tx_index = (tx_index << 8) | *++rlp;
+		}
+		rlp++;
+
+		/* Decode RLP tx_amount number. */
+		if (*rlp <= 0x7f) {
+			tx_amount = *rlp;
+		} else if (*rlp > 0x88) {
+			goto err_syntax_blockBody;
+		} else {
+			size_t num_len = *rlp - 0x80;
+			tx_amount = 0;
+			while (num_len-- > 0)
+				tx_amount = (tx_amount << 8) | *++rlp;
+		}
+		rlp++;
+
+		/* Write block number, transaction count and uncles. */
+		write_u64(&writer, block);
+		write_u64(&writer, tx_amount);
+		write_u64(&writer, rlp_len - (rlp - rlp_base));
+		write_array(&writer, rlp, rlp_len - (rlp - rlp_base));
+
+		/* Write transactions. */
+		bool first_tx_in_block = true;
+		for (; tx_amount != 0; tx_index++, tx_amount--) {
+			MDBX_val key_blockTransaction, data_blockTransaction;
+			uint64_t key_tx_index_be;
+			if (first_tx_in_block) {
+				put64be((byte *)&key_tx_index_be, tx_index);
+				key_blockTransaction.iov_base = (void *)&key_tx_index_be;
+				key_blockTransaction.iov_len = 8;
+			}
+			rc = mdbx_cursor_get(cursor_blockTransaction,
+					     &key_blockTransaction, &data_blockTransaction,
+					     first_tx_in_block ? MDBX_SET : MDBX_NEXT);
+			if (rc != MDBX_SUCCESS) {
+				error("mdbx_cursor_get BlockTransaction", rc);
+				goto err;
+			}
+			first_tx_in_block = false;
+
+			uint64_t key_tx_index = get64be((const byte *)key_blockTransaction.iov_base);
+			if (key_tx_index != tx_index) {
+				fprintf(stderr, "BlockTransaciton next tx_index %llu != expected %llu\n",
+					(unsigned long long)key_tx_index,
+					(unsigned long long)tx_index);
+				rc = MDBX_INVALID;
+				goto err;
+			}
+
+			size_t tx_len = data_blockTransaction.iov_len;
+			tx_count++;
+			total_size += tx_len;
+			write_u64(&writer, tx_len);
+			write_array(&writer, data_blockTransaction.iov_base, tx_len);
+		}
+	}
+
+	fprintf(stderr, "Finished extract_txbodies file=%s, blocks=%llu, dups=%llu, txs=%llu, total_size=%llu\n",
+		file->name, (unsigned long long)block_count,
+		(unsigned long long)block_dups,
+		(unsigned long long)tx_count,
+		(unsigned long long)total_size);
+	rc = MDBX_SUCCESS;
+err:
+	file_close(file, rc != MDBX_SUCCESS);
+	mdbx_cursor_close(cursor_blockTransaction);
+err_cursor_blockTransaction:
+err_dbi_blockTransaction:
+	mdbx_cursor_close(cursor_blockBody);
+err_cursor_blockBody:
+err_dbi_blockBody:
+	return rc;
+err_syntax_blockBody:
+	fprintf(stderr, "BlockBody value syntax error\n");
+	print_mdbx_val(&key_blockBody);
+	print_mdbx_val(&data_blockBody);
+	rc = MDBX_INVALID;
+	goto err;
+}
+
 struct Reader {
 	struct File *file;
 	uint64_t block, incarnation;
@@ -1761,6 +1987,10 @@ int main(int argc, char *argv[]) {
 	if (rc != MDBX_SUCCESS)
 		goto txn_abort;
 	printf("Reading block range 0 to %llu\n", (unsigned long long)latest_block);
+
+	//rc = extract_txbodies(env, txn, 0, 100000);
+	//rc = extract_txbodies(env, txn, 0, latest_block);
+	rc = jobs_run_multithread(env, NULL, 0, latest_block, 100000, 64, extract_txbodies);
 
 	//rc = extract_blockrange(env, txn, 13520000, 14005000);
 //	rc = extract_blockrange(env, txn, 5000000, 13807650);

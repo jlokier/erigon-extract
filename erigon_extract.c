@@ -748,12 +748,32 @@ static void write_storage(struct Writer *writer, const struct Storage *storage)
 	 */
 	if (storage->incarnation != base_incarnation) {
 		if (storage->incarnation < base_incarnation) {
+			/*
+			 * Just a warning, because the "same-address
+			 * incarnation decreasing" has been seen in Goerli
+			 * `PlainState`, so perhaps it is acceptable:
+			 *
+			 * (set address=00000000005eaadadcd5bc0a2c4999980aa8deb8)
+			 *   Account block=5636094 address=00000000005eaadadcd5bc0a2c4999980aa8deb8
+			 *           inc=4 nonce=1 balance=0 codeHash=6f9335e439a585778643aa1b5759da8241a489df9dbaddf797164a5f0b379ec1
+			 *   Storage block=5636094 slot=00000000005eaadadcd5bc0a2c4999980aa8deb8/0000000000000000000000000000000000000000000000000000000000000002
+			 *           inc=3 value=40
+			 * Warning: Storage with same-address incarnation decreasing
+			 *   Storage block=5636094 slot=00000000005eaadadcd5bc0a2c4999980aa8deb8/0000000000000000000000000000000000000000000000000000000000000002
+>			 *           inc=3 value=40
+			 */
+			if (!PRINT) {
+				print_address(storage->item_base.address);
+				print_block_number(storage->item_base.block);
+				print_storage(storage);
+			}
 			if (storage->incarnation == 0)
-				fprintf(stderr, "Error: Storage with incarnation == 0\n");
+				fprintf(stderr, "Warning: ^ Storage with incarnation == 0\n");
 			else
-				fprintf(stderr, "Error: Storage with same-address incarnation decreasing\n");
-			print_storage(storage);
-			exit(EXIT_FAILURE);
+				fprintf(stderr, "Warning: ^ Storage with same-address incarnation decreasing\n");
+
+			if (storage->incarnation == 0)
+				exit(EXIT_FAILURE);
 		}
 		uint64_t encoded_incarnation = storage->incarnation - base_incarnation;
 		writer->storage_incarnation = storage->incarnation;

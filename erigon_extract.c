@@ -452,6 +452,8 @@ static int file_close(struct File *file, bool delete_file)
 		/* `ferror` doesn't set `errno`. */
 		fclose(file->file);
 		fprintf(stderr, "Error processing file %s\n", file->name);
+		free(file->buffer);
+		free(file);
 		errno = EIO;
 		return -1;
 	}

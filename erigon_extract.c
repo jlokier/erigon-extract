@@ -1,27 +1,19 @@
-/* mdbx_dump.c - memory-mapped database dump tool */
-
 /*
- * Copyright 2015-2021 Leonid Yuriev <leo@yuriev.ru>
- * and other libmdbx authors: please see AUTHORS file.
- * All rights reserved.
+ * erigon_extract: ETL for Nimbus-eth1 full state
+ * Reads an Erigon database, writes an DB file for Nimbus-eth1.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted only as authorized by the OpenLDAP
- * Public License.
+ * Copyright (C) 2021, 2022 Jamie Lokier
  *
- * A copy of this license is available in the file LICENSE in the
- * top-level directory of the distribution or, alternatively, at
- * <http://www.OpenLDAP.org/license.html>. */
+ * This file is licensed under either of "MIT license" or "Apache License,
+ * Version 2.0", at your option.  Links to each license respectively:
+ * - <http://opensource.org/licenses/MIT>
+ * - <http://www.apache.org/licenses/LICENSE-2.0>.
+ *
+ * This file is provided without any warranty.  Use at your own risk.  It is
+ * intended that excerpts be used and changed in other programs, subject to the
+ * terms of the one or both of the above licenses.
+ */
 
-#ifdef _MSC_VER
-#if _MSC_VER > 1800
-#pragma warning(disable : 4464) /* relative include path contains '..' */
-#endif
-#pragma warning(disable : 4996) /* The POSIX name is deprecated... */
-#endif                          /* _MSC_VER (warnings) */
-
-#define xMDBX_TOOLS /* Avoid using internal mdbx_assert() */
-//#include "internals.h"
 #include "mdbx.h"
 
 #include <ctype.h>
@@ -32,25 +24,20 @@
 #include <string.h>
 #include <unistd.h>
 
-#if defined(_WIN32) || defined(_WIN64)
-#include "libmdbx/src/wingetopt.h"
+static volatile sig_atomic_t stop_flag;
 
-static volatile BOOL user_break;
-static BOOL WINAPI ConsoleBreakHandlerRoutine(DWORD dwCtrlType) {
-  (void)dwCtrlType;
-  user_break = true;
-  return true;
+static void signal_handler(int sig)
+{
+	stop_flag = 1;
 }
 
-#else /* WINDOWS */
-
-static volatile sig_atomic_t user_break;
-static void signal_handler(int sig) {
-  (void)sig;
-  user_break = 1;
+static void setup_signal_handler(void)
+{
+	signal(SIGPIPE, signal_handler);
+	signal(SIGHUP, signal_handler);
+	signal(SIGINT, signal_handler);
+	signal(SIGTERM, signal_handler);
 }
-
-#endif /* !WINDOWS */
 
 typedef uint8_t byte;
 
@@ -81,13 +68,14 @@ static void print_number(const char *bytes, size_t start, size_t end)
 	print_bytes(bytes, start, end);
 }
 
-static void print_mdbx_val(MDBX_val *v) {
+static void print_mdbx_val(MDBX_val *v)
+{
 	putchar(' ');
 	print_bytes(v->iov_base, 0, v->iov_len);
 	putchar('\n');
 }
 
-bool quiet = false;
+bool verbose = true;
 const char *prog;
 
 #define PRINT 0
@@ -98,13 +86,15 @@ const char *prog;
 #define CODE_INCARNATION  250 /* Single value 250 */
 #define CODE_BLOCK_INLINE 251 /* Range 251..255   */
 
-static void error(const char *func, int rc) {
-	if (!quiet)
+static void error(const char *func, int rc)
+{
+	if (verbose)
 		fprintf(stderr, "%s: %s() error %d %s\n", prog, func, rc,
 			mdbx_strerror(rc));
 }
 
-static uint64_t get64be(const byte *bytes) {
+static uint64_t get64be(const byte *bytes)
+{
 	uint64_t result = 0;
 	result = (result << 8) + *(const uint8_t *)bytes++;
 	result = (result << 8) + *(const uint8_t *)bytes++;
@@ -117,7 +107,8 @@ static uint64_t get64be(const byte *bytes) {
 	return result;
 }
 
-static void put64be(byte *bytes, uint64_t value) {
+static void put64be(byte *bytes, uint64_t value)
+{
 	*bytes++ = (byte)(value >> 56);
 	*bytes++ = (byte)(value >> 48);
 	*bytes++ = (byte)(value >> 40);
@@ -128,7 +119,8 @@ static void put64be(byte *bytes, uint64_t value) {
 	*bytes++ = (byte)value;
 }
 
-static uint64_t get64be_len(const byte *bytes, size_t len) {
+static uint64_t get64be_len(const byte *bytes, size_t len)
+{
 	uint64_t result = 0;
 	for (size_t i = 0; i < 8 && i < len; i++)
 		result = (result << 8) + *(const uint8_t *)bytes++;
@@ -920,7 +912,7 @@ static int extract_blockrange(MDBX_env *env, MDBX_txn *txn,
 		goto err_dbi_codeHash;
 	}
 
-	struct File *file = file_open(true, "./data/blocks-x-%llu-%llu.dat",
+	struct File *file = file_open(true, "./data/blocks-%llu-%llu.dat",
 				      (unsigned long long)block_start,
 				      (unsigned long long)(block_end - 1));
 	if (!file) {
@@ -936,7 +928,7 @@ static int extract_blockrange(MDBX_env *env, MDBX_txn *txn,
 	bool have_account = false, have_storage = false;
 	bool done_accounts = false, done_storage = false;
 
-	while (!user_break && (!done_accounts || !done_storage)) {
+	while (!stop_flag && (!done_accounts || !done_storage)) {
 		uint64_t key_block_be;
 		if (first_item) {
 			put64be((byte *)&key_block_be, block_start);
@@ -1101,7 +1093,7 @@ static int extract_plainstate(MDBX_env *env, MDBX_txn *txn, uint64_t block)
 
 	bool first_time = true;
 
-	while (!user_break) {
+	while (!stop_flag) {
 		rc = mdbx_cursor_get(cursor_plainState, &key_plainState, &data_plainState,
 				     first_time ? MDBX_FIRST : MDBX_NEXT);
 		if (rc == MDBX_SUCCESS) {
@@ -1234,7 +1226,7 @@ static int extract_txbodies(MDBX_env *v, MDBX_txn *txn,
 	uint64_t block_count = 0, tx_count = 0, total_size = 0;
 	uint64_t block_expected = block_start, block_dups = 0;
 
-	while (!user_break) {
+	while (!stop_flag) {
 		uint64_t key_block_be;
 		if (first_time) {
 			put64be((byte *)&key_block_be, block_start);
@@ -1461,11 +1453,11 @@ static uint64_t read_u64(struct Reader *reader)
  * Returns 0 on success and sets `*item_out`, or -1 and sets `errno`.
  *
  * 0 with `*item_out == NULL` is returned on an acceptable end of file, meaning
- * one that doesn't interrupt the syntax.
+ * one that doesn't stop the syntax.
  *
  * Error `EINVAL` is used when bad input syntax is found.
  * Error `EIO` is used when `ferror()` indicates a file error or EOF.
- * Error `EINTR` is used when `user_break` was set.
+ * Error `EINTR` is used when `stop_flag` was set.
  */
 static int read_item(struct Reader *reader, bool print, struct ReaderItem **item_out)
 {
@@ -1473,7 +1465,7 @@ static int read_item(struct Reader *reader, bool print, struct ReaderItem **item
 	bool first_time = true;
 	int b;
 
-	while (!user_break) {
+	while (!stop_flag) {
 		/* `feof()` will not return true until this returns EOF. */
 		b = getc(file);
 		if (b == EOF) {
@@ -1593,7 +1585,7 @@ static int read_item(struct Reader *reader, bool print, struct ReaderItem **item
 			goto err_syntax;
 		}
 	}
-	// `user_break` was set.
+	// `stop_flag` was set.
 	errno = EAGAIN;
 	return -1;
 err_syntax:
@@ -1626,10 +1618,10 @@ static int show_file(const char *filename)
 	struct Reader reader;
 	reader_init(&reader, file);
 
-	while (!user_break) {
+	while (!stop_flag) {
 		struct ReaderItem *item;
 		if (read_item(&reader, true, &item) != 0) {
-			if (user_break)
+			if (stop_flag)
 				break;
 			rc = (errno == EINVAL) ? MDBX_INVALID : MDBX_EIO;
 			goto err;
@@ -1686,10 +1678,10 @@ static int transpose_blockrange(uint64_t block_start, uint64_t block_end)
 	struct Reader reader;
 	reader_init(&reader, file_in);
 
-	while (!user_break) {
+	while (!stop_flag) {
 		struct ReaderItem *item;
 		if (read_item(&reader, false, &item) != 0) {
-			if (user_break)
+			if (stop_flag)
 				break;
 			rc = (errno == EINVAL) ? MDBX_INVALID : MDBX_EIO;
 			goto err;
@@ -1714,7 +1706,7 @@ static int transpose_blockrange(uint64_t block_start, uint64_t block_end)
 		vector_data[vector_len] = item_copy;
 		vector_len++;
 	}
-	if (user_break)
+	if (stop_flag)
 		goto done;
 
 	fprintf(stderr, "Sorting in transpose_blockrange file_in=%s\n", file_in->name);
@@ -1731,7 +1723,7 @@ static int transpose_blockrange(uint64_t block_start, uint64_t block_end)
 	writer_init(&writer, file_out);
 	writer.strategy = 1;
 
-	for (size_t i = 0; i < vector_len && !user_break; i++) {
+	for (size_t i = 0; i < vector_len && !stop_flag; i++) {
 		struct ReaderItem *item = vector_data[i];
 		/* Write address first, so all block deltas work including the first. */
 		write_address(&writer, item->address);
@@ -1823,7 +1815,7 @@ static int jobs_run_multithread(MDBX_env *env, MDBX_txn *txn_only_if_shared,
 					  uint64_t range_start,
 					  uint64_t range_end))
 {
-	while (!user_break && range_start < range_end) {
+	while (!stop_flag && range_start < range_end) {
 		job_allocate(max_concurrent);
 
 		uint64_t end = range_start + range_step;
@@ -1849,20 +1841,6 @@ static int extract_blockrange_multithread(MDBX_env *env, MDBX_txn *txn,
 				    100000, 64, extract_blockrange);
 }
 
-static void usage(void) {
-  fprintf(stderr,
-          "usage: %s [-V] [-q] [-f file] [-l] [-p] [-r] [-a|-s subdb] "
-          "dbpath\n"
-          "  -V\t\tprint version and exit\n"
-          "  -q\t\tbe quiet\n"
-          "  -f\t\twrite to file instead of stdout\n"
-          "  -l\t\tlist subDBs and exit\n"
-          "  -s name\tdump only the specified named subDB\n"
-          "  \t\tby default dump only the main DB\n",
-          prog);
-  exit(EXIT_FAILURE);
-}
-
 static int equal_or_greater(const MDBX_val *a, const MDBX_val *b) {
   return (a->iov_len == b->iov_len &&
           memcmp(a->iov_base, b->iov_base, a->iov_len) == 0)
@@ -1870,84 +1848,40 @@ static int equal_or_greater(const MDBX_val *a, const MDBX_val *b) {
              : 1;
 }
 
+static void show_usage(void)
+{
+	fprintf(stderr,
+		"Usage: %s [OPTIONS] </path/to/erigon/chaindata>\n"
+		"Options:\n"
+		"-q    Don't output some messages\n", prog);
+	exit(EXIT_FAILURE);
+}
+
 int main(int argc, char *argv[]) {
-	int i, rc;
-	MDBX_env *env;
-	MDBX_txn *txn;
 	prog = argv[0];
-	char *envname;
-	unsigned envflags = 0;
-	bool list = false;
-
 	if (argc < 2)
-		usage();
+		show_usage();
 
-	while ((i = getopt(argc, argv,
-			   "f:"
-			   "l"
-			   "n"
-			   "V"
-			   "q")) != EOF) {
-		switch (i) {
-		case 'V':
-			printf("mdbx_dump version %d.%d.%d.%d\n"
-			       " - source: %s %s, commit %s, tree %s\n"
-			       " - build: %s for %s by %s\n"
-			       " - flags: %s\n"
-			       " - options: %s\n",
-			       mdbx_version.major, mdbx_version.minor, mdbx_version.release,
-			       mdbx_version.revision, mdbx_version.git.describe,
-			       mdbx_version.git.datetime, mdbx_version.git.commit,
-			       mdbx_version.git.tree, mdbx_build.datetime,
-			       mdbx_build.target, mdbx_build.compiler, mdbx_build.flags,
-			       mdbx_build.options);
-			return EXIT_SUCCESS;
-		case 'l':
-			list = true;
-			/*FALLTHROUGH*/;
-			//__fallthrough;
-		case 'f':
-			if (freopen(optarg, "w", stdout) == NULL) {
-				fprintf(stderr, "%s: %s: reopen: %s\n", prog, optarg,
-					mdbx_strerror(errno));
-				exit(EXIT_FAILURE);
-			}
-			break;
-		case 'n':
-			break;
+	int ch;
+	while ((ch = getopt(argc, argv, "q")) != EOF) {
+		switch (ch) {
 		case 'q':
-			quiet = true;
+			verbose = false;
 			break;
 		default:
-			usage();
+			show_usage();
 		}
 	}
 
 	if (optind != argc - 1)
-		usage();
+		show_usage();
 
-#if defined(_WIN32) || defined(_WIN64)
-	SetConsoleCtrlHandler(ConsoleBreakHandlerRoutine, true);
-#else
-#ifdef SIGPIPE
-	signal(SIGPIPE, signal_handler);
-#endif
-#ifdef SIGHUP
-	signal(SIGHUP, signal_handler);
-#endif
-	signal(SIGINT, signal_handler);
-	signal(SIGTERM, signal_handler);
-#endif /* !WINDOWS */
+	setup_signal_handler();
 
-	envname = argv[optind];
-	if (!quiet) {
-		fprintf(stderr, "mdbx_dump %s (%s, T-%s)\nRunning for %s...\n",
-			mdbx_version.git.describe, mdbx_version.git.datetime,
-			mdbx_version.git.tree, envname);
-		fflush(NULL);
-	}
+	const char *input_db_path = argv[optind];
 
-	rc = mdbx_env_create(&env);
+	MDBX_env *env;
+	int rc = mdbx_env_create(&env);
 	if (rc != MDBX_SUCCESS) {
 		error("mdbx_env_create", rc);
 		return EXIT_FAILURE;
@@ -1977,12 +1911,13 @@ int main(int argc, char *argv[]) {
 	// read and up taking a lot more RAM cache than necessary, and the
 	// effect of that during repeated runs is more important than potential
 	// benefits from readahead.
-	rc = mdbx_env_open(env, envname, envflags | MDBX_RDONLY | MDBX_NORDAHEAD, 0);
+	rc = mdbx_env_open(env, input_db_path, MDBX_RDONLY | MDBX_NORDAHEAD, 0);
 	if (rc != MDBX_SUCCESS) {
 		error("mdbx_env_open", rc);
 		goto env_close;
 	}
 
+	MDBX_txn *txn;
 	rc = mdbx_txn_begin(env, NULL, MDBX_TXN_RDONLY, &txn);
 	if (rc != MDBX_SUCCESS) {
 		error("mdbx_txn_begin", rc);
@@ -1995,9 +1930,15 @@ int main(int argc, char *argv[]) {
 		goto txn_abort;
 	printf("Reading block range 0 to %llu\n", (unsigned long long)latest_block);
 
+	/*
+	 * Operations scales for Goerli.  Simpler than Mainnet because it fits
+	 * in the server's RAM.
+	 */
+	rc = extract_txbodies(env, txn, 0, latest_block);
+
 	//rc = extract_txbodies(env, txn, 0, 100000);
 	//rc = extract_txbodies(env, txn, 0, latest_block);
-	rc = jobs_run_multithread(env, NULL, 0, latest_block, 100000, 64, extract_txbodies);
+	//rc = jobs_run_multithread(env, NULL, 0, latest_block, 100000, 64, extract_txbodies);
 
 	//rc = extract_blockrange(env, txn, 13520000, 14005000);
 //	rc = extract_blockrange(env, txn, 5000000, 13807650);
@@ -2015,10 +1956,11 @@ int main(int argc, char *argv[]) {
 	//rc = transpose_blockrange(10000000, 10100000);
 	//rc = show_file("./data/blocks-10000000-10099999.dat");
 	//rc = show_file("./data/transposed-10000000-10099999.dat");
+#endif
 
 	if (rc == MDBX_NOTFOUND)
 		rc = MDBX_SUCCESS;
-	if (rc == MDBX_EINTR && !quiet)
+	if (rc == MDBX_EINTR && verbose)
 		fprintf(stderr, "Interrupted by signal/user\n");
 
 	jobs_wait_finish();

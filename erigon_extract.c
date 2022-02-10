@@ -1930,12 +1930,16 @@ int main(int argc, char *argv[]) {
 		goto txn_abort;
 	printf("Reading block range 0 to %llu\n", (unsigned long long)latest_block);
 
+#if 1
 	/*
-	 * Operations scales for Goerli.  Simpler than Mainnet because it fits
-	 * in the server's RAM.
+	 * Operations scaled for Goerli.  Simpler than Mainnet.  We don't need
+	 * many parallel operations and a many transpososition intermediate
+	 * files, because it almost fits in the server's RAM.
 	 */
 	rc = extract_txbodies(env, txn, 0, latest_block);
-
+	rc = extract_blockrange(env, txn, 0, latest_block);
+	rc = extract_plainstate(env, txn, latest_block);
+#else
 	//rc = extract_txbodies(env, txn, 0, 100000);
 	//rc = extract_txbodies(env, txn, 0, latest_block);
 	//rc = jobs_run_multithread(env, NULL, 0, latest_block, 100000, 64, extract_txbodies);

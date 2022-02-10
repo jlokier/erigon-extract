@@ -1953,9 +1953,16 @@ int main(int argc, char *argv[]) {
 		return EXIT_FAILURE;
 	}
 
-	// Need 5 dbis: `SyncStage`, `AccountChangeSet`, `StorageChangeSet`,
-	// `PlainCodeHash` and `PlainState`.
-	rc = mdbx_env_set_maxdbs(env, 5);
+	/*
+	 * The number of dbis is the maximum number of tables allowed to be
+	 * accessed while this file is open, even if they are not at the same
+	 * time.  (dbis are never closed).
+	 *
+	 * We need 7 dbis: `SyncStage`, `AccountChangeSet`, `StorageChangeSet`,
+	 *`PlainCodeHash`, `PlainState`, `BlockBody`, `BlockTransaction`.  Add
+	 * some extra so we're not confused when we use open another.
+	 */
+	rc = mdbx_env_set_maxdbs(env, 15);
 	if (rc != MDBX_SUCCESS) {
 		error("mdbx_env_set_maxdbs", rc);
 		goto env_close;

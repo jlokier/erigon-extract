@@ -25,13 +25,37 @@
 #include <unistd.h>
 
 #if CALCULATE_KECCAK256
+
 #if 0
+/* https://github.com/brainhub/SHA3IUF */
 #include "SHA3IUF/sha3.h"
 #include "SHA3IUF/sha3.c"
+static inline keccak256(byte *hash, const byte *input, size_t length)
+{
+	sha3_context ctx;
+	sha3_Init256(&ctx);
+	sha3_SetFlags(&ctx, SHA3_FLAGS_KECCAK);
+	sha3_Update(&ctx, input, length);
+	const void *h = sha3_Finalize(&ctx);
+	memcpy(hash, h, 32);
+}
 #else
+/*
+ * https://github.com/firefly/wallet
+ * About 1.2 microseconds per short hash on my system.
+ */
 #include "wallet/source/libs/ethers/src/keccak256.h"
 #include "wallet/source/libs/ethers/src/keccak256.c"
+static inline keccak256(byte *hash, const byte *input, size_t length)
+{
+	SHA3_CTX ctx;
+	keccak_init(&ctx);
+	keccak_update(&ctx, input, length);
+	byte hash[32];
+	keccak_final(&ctx, hash);
+}
 #endif
+
 #endif
 
 static volatile sig_atomic_t stop_flag;
@@ -2123,29 +2147,6 @@ static int transpose_blockrange(uint64_t block_start, uint64_t block_end)
 	}
 	if (stop_flag)
 		goto done;
-
-#if CALCULATE_KECCAK256
-	fprintf(stderr, "Starting keccak count=%lu\n", (unsigned long)vector_len);
-	for (size_t i = 0; i < vector_len / 2; i++) {
-		byte input[32];
-		//memset(input, 0, 12);
-		memcpy(input + 12, vector_data[i]->address, ADDRESS_LEN);
-#if 0
-		sha3_context ctx;
-		sha3_Init256(&ctx);
-		sha3_SetFlags(&ctx, SHA3_FLAGS_KECCAK);
-		sha3_Update(&ctx, input + 12, 20);
-		sha3_Finalize(&ctx);
-#else
-		SHA3_CTX ctx;
-		keccak_init(&ctx);
-		keccak_update(&ctx, input + 12, 20);
-		byte hash[32];
-		keccak_final(&ctx, hash);
-#endif
-	}
-	fprintf(stderr, "Finished keccak\n");
-#endif
 
 	fprintf(stderr, "Sorting in transpose_blockrange file_in=%s\n", file_in->name);
 	qsort(vector_data, vector_len, sizeof(*vector_data), transpose_sort_order);

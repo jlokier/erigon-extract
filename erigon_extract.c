@@ -261,7 +261,7 @@ static int decode_account(const byte *account_bytes, size_t account_len,
 	if ((!(fieldset & 8)
 	     || 0 == memcmp(account->codeHash, empty_code_hash, HASH_LEN)
 	     || 0 == memcmp(account->codeHash, zero_code_hash, HASH_LEN))
-		&& account->incarnation != 0) {
+	    && account->incarnation != 0) {
 		byte lookup_code_hash[28];
 		memcpy(lookup_code_hash, address, ADDRESS_LEN);
 		put64be(lookup_code_hash + ADDRESS_LEN, account->incarnation);
@@ -2054,40 +2054,68 @@ err_file:
 	goto err;
 }
 
+static inline int compare_keys_except_block(struct ReaderItem *item1,
+					    struct ReaderItem *item2)
+{
+	int cmp = memcmp(item1->address, item2->address, ADDRESS_LEN);
+	if (cmp != 0)
+	    return cmp;
+
+	if (item1->is_storage || item2->is_storage) {
+		if (!item1->is_storage)
+			return -1;
+		else if (!item2->is_storage)
+			return +1;
+
+		struct Storage *storage1 = (struct Storage *)item1;
+		struct Storage *storage2 = (struct Storage *)item2;
+
+		if (storage1->incarnation < storage2->incarnation)
+			return -1;
+		else if (storage1->incarnation > storage2->incarnation)
+			return +1;
+
+		cmp = memcmp(storage1->slot, storage2->slot, SLOT_LEN);
+		if (cmp != 0)
+			return cmp;
+	}
+
+	return 0;
+}
+
+static inline int compare_keys(struct ReaderItem *item1,
+			       struct ReaderItem *item2)
+{
+	int cmp = compare_keys_except_block(item1, item2);
+	if (cmp != 0)
+		return cmp;
+
+	if (item1->block < item2->block)
+		return -1;
+	else if (item1->block > item2->block)
+		return +1;
+
+	if (!item1->is_storage)
+		print_account((struct Account *)item1);
+	else
+		print_storage((struct Storage *)item1);
+
+	if (!item2->is_storage)
+		print_account((struct Account *)item2);
+	else
+		print_storage((struct Storage *)item2);
+
+	fprintf(stderr, "Error: ^^ Two equal keys\n");
+	/* The data should never contain duplicate keys. */
+	abort();
+	return 0;
+}
+
 static int transpose_sort_order(const void *arg1, const void *arg2)
 {
 	struct ReaderItem *item1 = *(struct ReaderItem **)arg1;
 	struct ReaderItem *item2 = *(struct ReaderItem **)arg2;
-	int cmp = memcmp(item1->address, item2->address, ADDRESS_LEN);
-	if (cmp == 0 && (item1->is_storage || item2->is_storage)) {
-		if (!item1->is_storage)
-			cmp = -1;
-		else if (!item2->is_storage)
-			cmp = +1;
-		else {
-			struct Storage *storage1 = (struct Storage *)item1;
-			struct Storage *storage2 = (struct Storage *)item2;
-			cmp = memcmp(storage1->slot, storage2->slot, SLOT_LEN);
-		}
-	}
-	if (cmp == 0) {
-		cmp = (item1->block < item2->block ? -1
-		       : item1->block > item2->block ? +1 : 0);
-	}
-	if (cmp == 0) {
-		if (!item1->is_storage)
-			print_account((struct Account *)item1);
-		else
-			print_storage((struct Storage *)item1);
-		if (!item2->is_storage)
-			print_account((struct Account *)item2);
-		else
-			print_storage((struct Storage *)item2);
-		fprintf(stderr, "Warning: ^^ Two equal keys\n");
-		/* The data should never contain duplicate keys. */
-		abort();
-	}
-	return cmp;
+	return compare_keys(item1, item2);
 }
 
 static int transpose_blockrange(uint64_t block_start, uint64_t block_end)
@@ -2242,9 +2270,8 @@ static int merge_files(const char *filename1, const char *filename_plain,
 			input->file->name, i + 1, num_inputs, file_out->name);
 	}
 
-	bool have_address = false, have_slot = false;
-	byte current_address[ADDRESS_LEN];
-	byte current_slot[SLOT_LEN];
+	bool first_time = true;
+	union { struct Account account; struct Storage storage; } previous_item;
 	uint64_t next_block_change = 0;
 
 	uint64_t input_counts[2] = { 0, 0 };
@@ -2282,8 +2309,8 @@ static int merge_files(const char *filename1, const char *filename_plain,
 			if (!input->item)
 				continue;
 			if (lowest_item_index < 0
-			    || transpose_sort_order(&input->item,
-						    &inputs[lowest_item_index].item) < 0) {
+			    || compare_keys(input->item,
+					    inputs[lowest_item_index].item) < 0) {
 				lowest_item_index = i;
 			}
 		}
@@ -2296,23 +2323,15 @@ static int merge_files(const char *filename1, const char *filename_plain,
 		input->item = NULL;
 		input_counts[lowest_item_index]++;
 
-		bool same_address_and_slot = true;
-		if (!have_address
-		    || 0 != memcmp(current_address, item->address, ADDRESS_LEN)) {
-			memcpy(current_address, item->address, ADDRESS_LEN);
-			have_address = true;
-			same_address_and_slot = false;
-		}
-		if (!item->is_storage) {
-			have_slot = false;
-		} else if (!have_slot
-			   || 0 != memcmp(current_slot, ((struct Storage *)item)->slot, SLOT_LEN)) {
-			memcpy(current_slot, ((struct Storage *)item)->slot, SLOT_LEN);
-			have_slot = true;
-			same_address_and_slot = false;
-		}
+		int cmp = first_time ? +1
+			: compare_keys_except_block(&previous_item.account.item_base, item);
+		first_time = false;
+		if (!item->is_storage)
+			previous_item.account = *(struct Account *)item;
+		else
+			previous_item.storage = *(struct Storage *)item;
 
-		uint64_t adjusted_block = same_address_and_slot ? next_block_change : 0;
+		uint64_t adjusted_block = cmp != 0 ? 0 : next_block_change;
 		next_block_change = item->block;
 		item->block = adjusted_block;
 

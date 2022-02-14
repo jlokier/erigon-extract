@@ -113,10 +113,11 @@ bool opt_verbose = true, opt_print = false;
 const char *prog;
 
 #define PRINT opt_print
-#define CODE_BLOCK_NUMBER 1  /* Range 1..8        */
-#define CODE_ADDRESS      9  /* Single value 9    */
-#define CODE_ACCOUNT      10 /* Range 10..73      */
-#define CODE_STORAGE      74 /* Range 74..249     */
+#define CODE_PAGE_PADDING   0 /* Single value 0   */
+#define CODE_BLOCK_NUMBER   1 /* Range 1..8       */
+#define CODE_ADDRESS        9 /* Single value 9   */
+#define CODE_ACCOUNT       10 /* Range 10..73     */
+#define CODE_STORAGE       74 /* Range 74..249    */
 #define CODE_INCARNATION  250 /* Single value 250 */
 #define CODE_BLOCK_INLINE 251 /* Range 251..255   */
 
@@ -511,8 +512,7 @@ static int file_close(struct File *file, bool delete_file)
 struct Writer {
 	struct File *file;
 	uint64_t count_accounts, count_storage_slots;
-	int strategy;
-	bool have_block, have_address;
+	int strategy, page_shift;
 	uint64_t block, nonce, account_incarnation, storage_incarnation;
 	byte address[ADDRESS_LEN];
 	byte balance[BALANCE_LEN];
@@ -522,7 +522,7 @@ struct Writer {
 
 struct Reader {
 	struct File *file;
-	int strategy;
+	int strategy, page_shift;
 	union {
 		struct Account account;
 		struct Storage storage;
@@ -537,9 +537,8 @@ struct Reader {
 
 static void writer_state_init(struct Writer *writer)
 {
-	writer->have_block = false;
-	writer->have_address = false;
 	writer->block = 0;
+	writer->nonce = 0;
 	writer->account_incarnation = 0;
 	writer->storage_incarnation = 0;
 	memset(writer->address, 0, ADDRESS_LEN);
@@ -552,6 +551,7 @@ static void writer_init(struct Writer *writer, struct File *file,
 			int strategy)
 {
 	writer->file = file;
+	writer->page_shift = 0;
 	writer->count_accounts = 0;
 	writer->count_storage_slots = 0;
 	writer->strategy = strategy;
@@ -561,6 +561,7 @@ static void writer_init(struct Writer *writer, struct File *file,
 static void reader_state_init(struct Reader *reader)
 {
 	reader->block = 0;
+	reader->nonce = 0;
 	reader->account_incarnation = 0;
 	reader->storage_incarnation = 0;
 	reader->bytecode_incarnation = 0;
@@ -574,6 +575,7 @@ static void reader_init(struct Reader *reader, struct File *file,
 			int strategy)
 {
 	reader->file = file;
+	reader->page_shift = 0;
 	reader->strategy = strategy;
 	reader_state_init(reader);
 }
@@ -674,10 +676,9 @@ static void invert(byte *bytes, size_t len)
 
 static void write_block_number(struct Writer *writer, uint64_t block)
 {
-	if (writer->have_block && block == writer->block)
+	if (block == writer->block)
 		return;
 	uint64_t delta_block = block - writer->block;
-	writer->have_block = true;
 	writer->block = block;
 
 	if (PRINT)
@@ -723,14 +724,8 @@ static void read_block_number(struct Reader *reader, uint64_t *block_number,
 
 static void write_address(struct Writer *writer, const byte address[ADDRESS_LEN])
 {
-	if (writer->have_address
-	    && 0 == memcmp(address, writer->address, ADDRESS_LEN))
+	if (0 == memcmp(address, writer->address, ADDRESS_LEN))
 		return;
-#if 0
-	byte delta_address[ADDRESS_LEN];
-	delta(delta_address, address, writer->address, ADDRESS_LEN);
-#endif
-	writer->have_address = true;
 	memcpy(writer->address, address, ADDRESS_LEN);
 
 	if (PRINT)
@@ -773,9 +768,52 @@ static void read_address(struct Reader *reader, byte address[ADDRESS_LEN])
 static const byte special[ADDRESS_LEN] = { SPECIAL_LOG_ADDRESS };
 #endif
 
+static void write_block_and_address(struct Writer *writer,
+				    const struct ReaderItem *item)
+{
+	if (writer->strategy == 0) {
+		write_block_number(writer, item->block);
+		write_address(writer, item->address);
+	} else {
+		/* Write address first, so all block deltas work including the first. */
+		write_address(writer, item->address);
+		write_block_number(writer, item->block);
+	}
+}
+
+/*
+ * When writing an entry passes a page boundary, replace it with padding, reset
+ * the incremental writer state, and write the entry again.  The reader can
+ * read from this entry without preceding ones.
+ */
+static bool write_check_page_boundary(struct Writer *writer, off_t file_offset)
+{
+	if (writer->page_shift == 0)
+		return false;
+	if (((file_offset ^ ftello(writer->file->file)) >> writer->page_shift) == 0)
+		return false;
+
+	if (fseeko(writer->file->file, file_offset, SEEK_SET) != 0) {
+		perror("fseeko");
+		exit(EXIT_FAILURE);
+	}
+
+	off_t mask = ((off_t)1 << writer->page_shift) - 1;
+	while ((file_offset & mask) != 0) {
+		putc(0, writer->file->file);
+		file_offset++;
+	}
+
+	//writer_state_init(writer);
+	return true;
+}
+
 static void write_account(struct Writer *writer, const struct Account *account)
 {
 	writer->count_accounts++;
+again:;
+	off_t file_offset = ftello(writer->file->file);
+	write_block_and_address(writer, &account->item_base);
 	byte flags = 0;
 
 	const byte *encoded_code_hash = account->codeHash;
@@ -965,6 +1003,9 @@ static void write_account(struct Writer *writer, const struct Account *account)
 	writer->storage_incarnation = account->incarnation;
 	memcpy(writer->balance, account->balance, BALANCE_LEN);
 	memcpy(writer->code_hash, account->codeHash, HASH_LEN);
+
+	if (write_check_page_boundary(writer, file_offset))
+		goto again;
 }
 
 /* Must match `write_account`. */
@@ -1063,6 +1104,9 @@ static void read_account(struct Reader *reader, struct Account *account,
 static void write_storage(struct Writer *writer, const struct Storage *storage)
 {
 	writer->count_storage_slots++;
+again:;
+	off_t file_offset = ftello(writer->file->file);
+	write_block_and_address(writer, &storage->item_base);
 	byte flags = 0;
 
 	if (storage->incarnation == 0 || (int64_t)storage->incarnation < 0) {
@@ -1201,6 +1245,9 @@ static void write_storage(struct Writer *writer, const struct Storage *storage)
 	if (writer->strategy >= 3 && is_new_slot) {
 		writer->block = 0;
 	}
+
+	if (write_check_page_boundary(writer, file_offset))
+		goto again;
 }
 
 /* Must match `write_storage`. */
@@ -1307,7 +1354,9 @@ static int read_item(struct Reader *reader, bool print, struct ReaderItem **item
 		}
 		first_time = false;
 
-		if (b < CODE_BLOCK_NUMBER) {
+		if (b == CODE_PAGE_PADDING) {
+			continue;
+		} else if (b < CODE_BLOCK_NUMBER) {
 			goto err_syntax;
 		} else if (b <= CODE_BLOCK_NUMBER + 7) {
 			read_block_number(reader, &reader->block, b);
@@ -1550,9 +1599,6 @@ static int extract_blockrange(MDBX_env *env, MDBX_txn *txn,
 		const byte *address = (is_account ? data_account.iov_base
 				       : (const byte *)key_storage.iov_base + BLOCK_LEN);
 
-		write_block_number(&writer, block);
-		write_address(&writer, address);
-
 		if (is_account) {
 			have_account = false;
 			struct Account account;
@@ -1676,9 +1722,6 @@ static int extract_plainstate(MDBX_env *env, MDBX_txn *txn, uint64_t block)
 
 		bool is_account = key_plainState.iov_len == ADDRESS_LEN;
 		const byte *address = key_plainState.iov_base;
-
-		write_block_number(&writer, block);
-		write_address(&writer, address);
 
 		if (is_account) {
 			struct Account account;
@@ -2025,14 +2068,6 @@ static int copy_file(int strategy_in, int strategy_out,
 			break;
 		}
 
-		if (strategy_out == 0) {
-			write_block_number(&writer, item->block);
-			write_address(&writer, item->address);
-		} else {
-			write_address(&writer, item->address);
-			write_block_number(&writer, item->block);
-		}
-
 		if (!item->is_storage) {
 			write_account(&writer, (const struct Account *)item);
 		} else {
@@ -2191,9 +2226,6 @@ static int transpose_blockrange(uint64_t block_start, uint64_t block_end)
 
 	for (size_t i = 0; i < vector_len && !stop_flag; i++) {
 		struct ReaderItem *item = vector_data[i];
-		/* Write address first, so all block deltas work including the first. */
-		write_address(&writer, item->address);
-		write_block_number(&writer, item->block);
 		if (!item->is_storage) {
 			write_account(&writer, (const struct Account *)item);
 		} else {
@@ -2254,6 +2286,7 @@ static int merge_files(const char *filename1, const char *filename_plain,
 	if (!file_out)
 		goto err_file;
 	writer_init(&writer, file_out, 1);
+	writer.page_shift = 12;
 
 	for (int i = 0; i < num_inputs; i++) {
 		struct MergeInput *input = &inputs[i];
@@ -2349,9 +2382,6 @@ static int merge_files(const char *filename1, const char *filename_plain,
 			//abort();
 		}
 
-		/* Write address first, so all block deltas work including the first. */
-		write_address(&writer, item->address);
-		write_block_number(&writer, item->block);
 		if (!item->is_storage) {
 			write_account(&writer, (const struct Account *)item);
 		} else {

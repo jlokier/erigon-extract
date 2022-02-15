@@ -1,3 +1,52 @@
+# Generate a compact state history database for Ethereum Mainnet
+
+## Usage
+
+You will need:
+
+- **At least 75 GiB of unused RAM** to run the Mainnet conversion
+- **At least 750 GB free disk space**
+- An Erigon instance that has been synced up to Mainnet and then stopped
+
+It's possible to read from the Erigon database without stopping Erigon, but
+that's not recommended as it will rapidly and permanently inflate the size of
+Erigon's database, and when it reaches 2.1TB, Erigon cannot function any more
+and stops working.
+
+After building `libmdbx` do:
+
+```sh
+make
+
+# Or symbolic link to your preferred location:
+mkdir data
+
+# Use the path to Erigon's `chaindata` directory.  `-M` is important:
+./erigon_extract -M ~/.erigon/mainnet/chaindata
+```
+
+Then wait a while.  On my system it takes a couple of hours.
+
+The final output file is called something like
+`./data/full-history-0-13818907.dat` for Mainnet at block number 13818907.
+
+That file contains the entire "archive mode" accounts and storage history from
+blocks 0 up to that block number.  At blocks 0-13818907 the total size is
+**<&nbsp;200&nbsp;GiB**.
+
+This `README` will be updated with an accurate size when it's available, as
+there is an issue in progress.  As a reference point, the component files take
+**121.54&nbsp;GiB**, but the merge process tends to expand it by 10-20%, so I'm
+giving a conservative "< 200 GiB" right now.
+
+Other networks can also be used, and the starting block can be changed by
+editing the code.  A "pruned mode" 90k blocks file can be generated using the
+`-P` option.
+
+The data format has been tested more with Goerli testnet than Mainnet at this
+point, but there is no reason to think they are different except for scale.
+**The Goerli file is 10.6&nbsp;GiB**.
+
 ## Summary
 
 This program is to do a large, one-off ETL ("extract, transform, load")

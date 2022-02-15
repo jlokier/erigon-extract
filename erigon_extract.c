@@ -843,14 +843,19 @@ again:;
 		//abort();
 	}
 #endif
+#if 0
 	if (account->incarnation != 0
 	    && account->incarnation - writer->account_incarnation >= 3) {
-		/* A few of these occur. */
+		/*
+		 * Too many of these occur to list when transforming Mainnet.
+		 * Relatively few on Goerli.
+		 */
 		print_account(account);
 		fflush(stdout);
 		fprintf(stderr, "Warning: ^ Account with delta incarnation >= 3\n");
 		//abort();
 	}
+#endif
 
 	/* Nonce delta encoding alone saves ~1.5% of storage. */
 	uint64_t encoded_nonce, encoded_incarnation;
@@ -2275,7 +2280,6 @@ static int merge_files(uint64_t block_start, uint64_t block_end)
 	//filename1 = NULL;
 
 	int rc;
-	int num_inputs = 2;
 	struct MergeInput {
 		struct File *file;
 		struct Reader reader;
@@ -2285,6 +2289,11 @@ static int merge_files(uint64_t block_start, uint64_t block_end)
 	struct MergeInput *inputs = NULL;
 	struct File *file_out = NULL;
 	struct Writer writer;
+
+	int range_start = block_start, range_end = block_end;
+	int range_step = 100000;
+	int num_inputs = (range_end - range_start + range_step) / range_step;
+	num_inputs++;
 
 	inputs = malloc(sizeof(struct MergeInput) * num_inputs);
 	if (!inputs)
@@ -2317,9 +2326,13 @@ static int merge_files(uint64_t block_start, uint64_t block_end)
 			input->file = file_open(false, "./data/plainstate-%llu.dat",
 						(unsigned long long)block_end);
 		} else {
+			int end = range_start + range_step - 1;
+			if (end > range_end)
+				end = range_end;
 			input->file = file_open(false, "./data/transposed-%llu-%llu.dat",
-						(unsigned long long)block_start,
-						(unsigned long long)block_end);
+						(unsigned long long)range_start,
+						(unsigned long long)end);
+			range_start = end + 1;
 		}
 		if (!input->file)
 			goto err_file;
@@ -2333,7 +2346,6 @@ static int merge_files(uint64_t block_start, uint64_t block_end)
 	union { struct Account account; struct Storage storage; } previous_item;
 	uint64_t next_block_change = 0;
 
-	uint64_t input_counts[2] = { 0, 0 };
 	while (!stop_flag) {
 		for (int i = 0; i < num_inputs; i++) {
 			struct MergeInput *input = &inputs[i];
@@ -2380,7 +2392,6 @@ static int merge_files(uint64_t block_start, uint64_t block_end)
 		struct MergeInput *input = &inputs[lowest_item_index];
 		struct ReaderItem *item = input->item;
 		input->item = NULL;
-		input_counts[lowest_item_index]++;
 
 		int cmp = first_time ? +1
 			: compare_keys_except_block(&previous_item.account.item_base, item);
@@ -2424,10 +2435,8 @@ static int merge_files(uint64_t block_start, uint64_t block_end)
 	if (rc != MDBX_SUCCESS)
 		goto err;
 
-	fprintf(stderr, "Finished merge_files (%d) file_out=%s -> read=%llu+%llu accounts=%llu storage_slots=%llu\n",
+	fprintf(stderr, "Finished merge_files (%d) file_out=%s -> accounts=%llu storage_slots=%llu\n",
 		num_inputs, file_out->name,
-		(unsigned long long)input_counts[0],
-		(unsigned long long)input_counts[1],
 		(unsigned long long)writer.count_accounts,
 		(unsigned long long)writer.count_storage_slots);
 	rc = MDBX_SUCCESS;
@@ -2479,15 +2488,16 @@ static void job_completed(void)
 static void jobs_wait_finish(void)
 {
 	job_allocate(1);
+	job_completed();
 }
 
 static void *job_run(void *arg)
 {
 	struct Job *job = arg;
-	MDBX_txn *txn = job->txn;
-	if (txn != NULL) {
-		job->fn(job->env, txn, job->range_start, job->range_end);
+	if (job->env == NULL || job->txn != NULL) {
+		job->fn(job->env, job->txn, job->range_start, job->range_end);
 	} else {
+		MDBX_txn *txn = NULL;
 		int rc = mdbx_txn_begin(job->env, NULL, MDBX_TXN_RDONLY, &txn);
 		if (rc != MDBX_SUCCESS) {
 			error("mdbx_txn_begin", rc);
@@ -2509,19 +2519,21 @@ static int jobs_run_multithread(MDBX_env *env, MDBX_txn *txn_only_if_shared,
 					  uint64_t range_end))
 {
 	while (!stop_flag && range_start < range_end) {
-		job_allocate(max_concurrent);
+		struct Job *job = malloc(sizeof(*job));
 
-		uint64_t end = range_start + range_step;
+		/* `end` is inclusive. */
+		uint64_t end = range_start + range_step - 1;
 		if (end > range_end)
 			end = range_end;
-
-		struct Job *job = malloc(sizeof(*job));
 		job->range_start = range_start;
 		job->range_end = end;
-		range_start = end;
+		range_start = end + 1;
+
 		job->env = env;
 		job->txn = txn_only_if_shared;
 		job->fn = fn;
+
+		job_allocate(max_concurrent);
 		pthread_create(&job->thread, NULL, job_run, job);
 	}
 	return MDBX_SUCCESS;
@@ -2532,6 +2544,32 @@ static int extract_blockrange_multithread(MDBX_env *env, MDBX_txn *txn,
 {
 	return jobs_run_multithread(env, NULL, block_start, block_end,
 				    100000, 64, extract_blockrange);
+}
+
+static int extract_txbodies_multithread(MDBX_env *env, MDBX_txn *txn,
+					uint64_t block_start, uint64_t block_end)
+{
+	return jobs_run_multithread(env, NULL, block_start, block_end,
+				    100000, 64, extract_txbodies);
+}
+
+static int job_transpose_blockrange(MDBX_env *dummy_env, MDBX_txn *dummy_txn,
+				    uint64_t block_start, uint64_t block_end)
+{
+	return transpose_blockrange(block_start, block_end);
+}
+
+static int transpose_blockrange_multithread(uint64_t block_start, uint64_t block_end)
+{
+	/*
+	 * Parameters 100000 and 8 led to a RAM usage over 60GiB (in Linux).
+	 * That's a little over 7.5G per thread, up to block 10000000 (10^7) on
+	 * Mainnet.  Even on my 128GiB RAM server, this was too much due to
+	 * other processes also running (Geth etc) and triggered the
+	 * out-of-memory process killer.   The concurrency is reduced to 6.
+	 */
+	return jobs_run_multithread(NULL, NULL, block_start, block_end,
+				    100000, 6, job_transpose_blockrange);
 }
 
 static int equal_or_greater(const MDBX_val *a, const MDBX_val *b) {
@@ -2550,7 +2588,9 @@ static void show_usage(void)
 		"-p    Print accounts and storages as they are written\n"
 		"-s    Show contents of a file instead of doing transformations\n"
 		"-S    Like -s but for files with strategy 1\n"
-		"-T    Like -s but for post-merge files with page layout\n",
+		"-T    Like -s but for post-merge files with page layout\n"
+		"-M    Use parallel I/O and CPU to handle Mainnet scale\n"
+		"-P    Prune to just last 90,000 blocks for a smaller file\n",
 		prog);
 	exit(EXIT_FAILURE);
 }
@@ -2559,13 +2599,15 @@ int main(int argc, char *argv[]) {
 	bool opt_show = false;
 	int opt_strategy = 0;
 	off_t opt_offset = 0;
+	bool opt_mainnet = false;
+	bool opt_prune = false;
 
 	prog = argv[0];
 	if (argc < 2)
 		show_usage();
 
 	int ch;
-	while ((ch = getopt(argc, argv, "qpsST")) != EOF) {
+	while ((ch = getopt(argc, argv, "qpsSTMP")) != EOF) {
 		switch (ch) {
 		case 'q':
 			opt_verbose = false;
@@ -2585,6 +2627,12 @@ int main(int argc, char *argv[]) {
 			opt_show = true;
 			opt_strategy = 0;
 			opt_offset = 256;
+			break;
+		case 'M':
+			opt_mainnet = true;
+			break;
+		case 'P':
+			opt_prune = true;
 			break;
 		default:
 			show_usage();
@@ -2657,58 +2705,64 @@ int main(int argc, char *argv[]) {
 		goto txn_abort;
 	printf("Reading block range 0 to %llu\n", (unsigned long long)latest_block);
 
-#if 1
-	/*
-	 * Operations scaled for Goerli.  Simpler than Mainnet.  We don't need
-	 * many parallel operations, or to transpose via intermediate files,
-	 * because the intermedia state fits in the server's RAM.
-	 */
-	//rc = extract_blockrange(env, txn, latest_block - 100000, latest_block);
-	//rc = transpose_blockrange(latest_block - 100000, latest_block);
-	//rc = extract_blockrange(env, txn, 0, latest_block);
-	//rc = transpose_blockrange(0, latest_block);
-	//rc = extract_plainstate(env, txn, latest_block);
-	rc = merge_files("transposed-0-5636094.dat", "plainstate-5636094.dat", "goerli-full-history-5636094.dat");
-	//rc = copy_file(0, 0, "blocks-0-5636094.dat", "blocks-0-5636094-2.dat");
-	//rc = copy_file(1, 3, "transposed-0-5636094.dat", "transposed-0-5636094-2.dat");
-	//rc = copy_file(0, 0, "plainstate-5636094.dat", "plainstate-5636094-2.dat");
-	//rc = copy_file(1, 1, "goerli-full-history-5636094.dat", "goerli-full-history-5636094-2.dat");
-	//rc = extract_txbodies(env, txn, 0, latest_block);
-	//rc = extract_blockrange(env, txn, 4000000, 4100000);
-	//rc = copy_file(0, 0, "blocks-4000000-4099999.dat", "blocks-4000000-4099999-2.dat");
-	//rc = transpose_blockrange(4000000, 4100000);
-	//rc = copy_file(1, 1, "transposed-4000000-4099999.dat", "transposed-4000000-4099999-2.dat");
-	//rc = copy_file(1, 1, "transposed-4000000-4099999-2.dat", "transposed-4000000-4099999-3.dat");
-#else
-	//rc = extract_txbodies(env, txn, 0, 100000);
-	//rc = extract_txbodies(env, txn, 0, latest_block);
-	//rc = jobs_run_multithread(env, NULL, 0, latest_block, 100000, 64, extract_txbodies);
+	uint64_t earliest_block = 0;
+	if (opt_prune) {
+		uint64_t keep_blocks = 90000;
+		earliest_block = (latest_block < keep_blocks ? 0
+				  : latest_block - keep_blocks + 1);
+	}
 
-	//rc = extract_blockrange(env, txn, 13520000, 14005000);
-//	rc = extract_blockrange(env, txn, 5000000, 13807650);
-	//rc = extract_blockrange_multithread(env, txn, 8000000, 8300000);
-	//rc = extract_blockrange_multithread(env, txn, 13000000, 13100000);
-	//rc = extract_blockrange_multithread(env, txn, 13800000, latest_block);
-	//rc = extract_blockrange_multithread(env, txn, 0, latest_block);
-	//rc = extract_plainstate(env, txn, latest_block);
-	//rc = show_file("./data/blocks-plainstate-13818907.dat", true);
-	//rc = show_file("./data/blocks-13800000-13818906.dat", true);
-	//rc = transpose_blockrange(100000, 200000);
-	//rc = show_file("./data/blocks-100000-199999.dat");
-	//rc = show_file("./data/transposed-100000-199999.dat");
-	//rc = extract_blockrange(env, txn, 10094500, 10100000);
-	//rc = transpose_blockrange(10000000, 10100000);
-	//rc = show_file("./data/blocks-10000000-10099999.dat");
-	//rc = show_file("./data/transposed-10000000-10099999.dat");
-#endif
+	if (opt_mainnet) {
+		/*
+		 * Operations scaled for Mainnet.  Requires high parallelism
+		 * for reasonable I/O performance reading MDBX, and for sorting
+		 * in the transpose step.  We cannot parallelise the merge step
+		 * unfortunately.
+		 */
+		rc = extract_blockrange_multithread(env, txn, earliest_block, latest_block);
+		if (rc != MDBX_SUCCESS)
+			goto err;
 
-	if (rc == MDBX_NOTFOUND)
-		rc = MDBX_SUCCESS;
-	if (rc == MDBX_EINTR && opt_verbose)
-		fprintf(stderr, "Interrupted by signal/user\n");
+		rc = extract_txbodies_multithread(env, txn, earliest_block, latest_block);
+		if (rc != MDBX_SUCCESS)
+			goto err;
+
+		jobs_wait_finish();
+		rc = transpose_blockrange_multithread(earliest_block, latest_block);
+		if (rc != MDBX_SUCCESS)
+			goto err;
+	} else {
+		/*
+		 * Operations scaled for Goerli.  Simpler than Mainnet.  We don't need
+		 * many parallel operations, or to transpose via intermediate files,
+		 * because the intermedia state fits in the server's RAM.
+		 */
+		rc = extract_blockrange(env, txn, earliest_block, latest_block);
+		if (rc != MDBX_SUCCESS)
+			goto err;
+
+		rc = extract_txbodies(env, txn, earliest_block, latest_block);
+		if (rc != MDBX_SUCCESS)
+			goto err;
+
+		rc = transpose_blockrange(earliest_block, latest_block);
+		if (rc != MDBX_SUCCESS)
+			goto err;
+	}
+
+	rc = extract_plainstate(env, txn, latest_block);
+	if (rc != MDBX_SUCCESS)
+		goto err;
 
 	jobs_wait_finish();
 
+	rc = merge_files(earliest_block, latest_block);
+	if (rc != MDBX_SUCCESS)
+		goto err;
+
+err:
+	if (rc == MDBX_EINTR && opt_verbose)
+		fprintf(stderr, "Interrupted by signal/user\n");
 txn_abort:
 	mdbx_txn_abort(txn);
 env_close:

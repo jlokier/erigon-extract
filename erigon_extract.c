@@ -678,14 +678,13 @@ static void write_block_number(struct Writer *writer, uint64_t block)
 {
 	if (block == writer->block)
 		return;
-	uint64_t delta_block = block - writer->block;
-	writer->block = block;
-
 	if (PRINT)
 		print_block_number(block);
 
+	uint64_t delta_block = block - writer->block;
 	if (writer->strategy == 0)
 		delta_block = block;
+	writer->block = block;
 
 	byte bytes[8];
 	put64be(bytes, delta_block);
@@ -693,7 +692,7 @@ static void write_block_number(struct Writer *writer, uint64_t block)
 	for (i = 0; i < 7; i++)
 		if (bytes[i] != 0)
 			break;
-	if (i == 7 && bytes[7] <= 4) {
+	if (i == 7 && bytes[7] <= 4 && writer->strategy >= 1) {
 		putc(CODE_BLOCK_INLINE + bytes[7], writer->file->file);
 	} else {
 		putc(CODE_BLOCK_NUMBER + (7 - i), writer->file->file);
@@ -726,38 +725,39 @@ static void write_address(struct Writer *writer, const byte address[ADDRESS_LEN]
 {
 	if (0 == memcmp(address, writer->address, ADDRESS_LEN))
 		return;
-	memcpy(writer->address, address, ADDRESS_LEN);
-
 	if (PRINT)
 		print_address(address);
 
 	putc(CODE_ADDRESS, writer->file->file);
 	write_array(writer, address, ADDRESS_LEN);
 
+	memcpy(writer->address, address, ADDRESS_LEN);
+	/* `write_storage` uses incarnation reference with strategy == 0 too. */
+	writer->account_incarnation = 0;
+	writer->storage_incarnation = 0;
+
+	/* New address resets some other compression values. */
 	if (writer->strategy >= 1) {
-		/* New address resets some other compression values. */
 		writer->block = 0;
 		writer->nonce = 0;
 		memset(writer->balance, 0, BALANCE_LEN);
 		memset(writer->code_hash, 0, HASH_LEN);
 	}
-	/* `write_storage` uses incarnation reference with strategy == 0 too. */
-	writer->account_incarnation = 0;
-	writer->storage_incarnation = 0;
 }
 
 /* Must match `write_address`. */
 static void read_address(struct Reader *reader, byte address[ADDRESS_LEN])
 {
 	read_array(reader, reader->address, ADDRESS_LEN);
+
+	reader->account_incarnation = 0;
+	reader->storage_incarnation = 0;
 	if (reader->strategy >= 1) {
 		reader->block = 0;
 		reader->nonce = 0;
 		memset(reader->balance, 0, BALANCE_LEN);
 		memset(reader->code_hash, 0, HASH_LEN);
 	}
-	reader->account_incarnation = 0;
-	reader->storage_incarnation = 0;
 }
 
 //#define SPECIAL_LOG_ADDRESS 0x00, 0x52, 0xb9, 0x4f, 0x97, 0x43, 0x12, 0x9d, 0x87, 0x78, 0x8b, 0x17, 0x75, 0x38, 0x66, 0xa5, 0x6b, 0xe2, 0x2e, 0xce
@@ -800,11 +800,11 @@ static bool write_check_page_boundary(struct Writer *writer, off_t file_offset)
 
 	off_t mask = ((off_t)1 << writer->page_shift) - 1;
 	while ((file_offset & mask) != 0) {
-		putc(0, writer->file->file);
+		putc(CODE_PAGE_PADDING, writer->file->file);
 		file_offset++;
 	}
 
-	//writer_state_init(writer);
+	writer_state_init(writer);
 	return true;
 }
 
@@ -834,8 +834,8 @@ again:;
 #if 0
 	if (is_zero_code_hash && account->incarnation != 0) {
 		/*
-		 * Many of these occur in `PlainState`, in too many to list.
-		 * Much fewer the in the history.
+		 * Too many of these occur in `PlainState` to list.
+		 * Much fewer than in the history (on Goerli).
 		 */
 		print_account(account);
 		fflush(stdout);
@@ -1305,22 +1305,6 @@ static void read_storage(struct Reader *reader, struct Storage *account,
 	memcpy(reader->storage_slot, storage->slot, SLOT_LEN);
 }
 
-static void write_header(struct Writer *writer, uint64_t file_size)
-{
-	uint64_t words[16] = { 0, };
-	words[0] = 202202111;
-	words[1] = file_size;
-	words[2] = (sizeof(words) / sizeof(words[0])) * 8;
-	words[3] = 12;
-
-	rewind(writer->file->file);
-	for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
-		byte bytes[8];
-		put64be(bytes, words[i]);
-		write_array(writer, bytes, sizeof(bytes));
-	}
-}
-
 /*
  * Parse file input and return the next `Account` or `Storage` item.  There's a
  * loop because it sometimes needs to parse multiple codes in the stream before
@@ -1355,6 +1339,7 @@ static int read_item(struct Reader *reader, bool print, struct ReaderItem **item
 		first_time = false;
 
 		if (b == CODE_PAGE_PADDING) {
+			reader_state_init(reader);
 			continue;
 		} else if (b < CODE_BLOCK_NUMBER) {
 			goto err_syntax;
@@ -1996,7 +1981,7 @@ err_syntax_blockBody:
  * was set when generating that file, and this can be used to verify that the
  * reader decoding logic matches the writer encoding logic.
  */
-static int show_file(int strategy, const char *filename)
+static int show_file(int strategy, off_t offset, const char *filename)
 {
 	int rc;
 	struct File *file = file_open(false, "%s", filename);
@@ -2004,7 +1989,13 @@ static int show_file(int strategy, const char *filename)
 		rc = MDBX_EIO;
 		goto err;
 	}
-	fprintf(stderr, "Starting show_file file=%s\n", file->name);
+	fprintf(stderr, "Starting show_file file=%s offset=%lld\n",
+		file->name, (long long)offset);
+
+	if (offset != 0 && fseeko(file->file, offset, SEEK_CUR) != 0) {
+		rc = MDBX_EIO;
+		goto err;
+	}
 
 	struct Reader reader;
 	reader_init(&reader, file, strategy);
@@ -2022,7 +2013,8 @@ static int show_file(int strategy, const char *filename)
 		}
 	}
 
-	fprintf(stderr, "Finished show_file file=%s\n", file->name);
+	fprintf(stderr, "Finished show_file file=%s offset=%lld\n",
+		file->name, (long long)offset);
 	rc = MDBX_SUCCESS;
 err:
 	file_close(file, false);
@@ -2253,8 +2245,31 @@ err_file:
 	goto err;
 }
 
-static int merge_files(const char *filename1, const char *filename_plain,
-		       const char *filename_out)
+static int write_header(struct Writer *writer, uint64_t end_of_states,
+			uint64_t block_start, uint64_t block_end)
+{
+	/*
+	 * The header is padded to 256 bytes (32 words) with zeros, for
+	 * in-place updates to huge files without regenerating them, and a
+	 * simple native-endian array with fixed offsets for simplicity.
+	 */
+	uint64_t words[32] = { 0, };
+	words[0] = 202202111;
+	words[1] = end_of_states;
+	words[2] = 256;
+	words[3] = writer->page_shift;
+	words[4] = block_start;
+	words[5] = block_end;
+	words[6] = writer->count_accounts;
+	words[6] = writer->count_storage_slots;
+
+	rewind(writer->file->file);
+	if (fwrite(words, sizeof(words), 1, writer->file->file) != 1)
+		return MDBX_EIO;
+	return MDBX_SUCCESS;
+}
+
+static int merge_files(uint64_t block_start, uint64_t block_end)
 {
 	//filename_plain = NULL;
 	//filename1 = NULL;
@@ -2282,19 +2297,30 @@ static int merge_files(const char *filename1, const char *filename_plain,
 		input->is_plain = (i == num_inputs - 1);
 	}
 
-	file_out = file_open(true, "./data/%s", filename_out);
+	file_out = file_open(true, "./data/full-history-%llu-%llu.dat",
+			     (unsigned long long)block_start,
+			     (unsigned long long)block_end);
+
 	if (!file_out)
 		goto err_file;
-	writer_init(&writer, file_out, 1);
+	writer_init(&writer, file_out, 0);
 	writer.page_shift = 12;
+
+	/* Make space for the header to be written afterwards. */
+	rc = write_header(&writer, 0, 0, 0);
+	if (rc != MDBX_SUCCESS)
+		goto err;
 
 	for (int i = 0; i < num_inputs; i++) {
 		struct MergeInput *input = &inputs[i];
-		const char *filename =
-			input->is_plain ? filename_plain : filename1;
-		if (!filename)
-			continue;
-		input->file = file_open(false, "./data/%s", filename);
+		if (input->is_plain) {
+			input->file = file_open(false, "./data/plainstate-%llu.dat",
+						(unsigned long long)block_end);
+		} else {
+			input->file = file_open(false, "./data/transposed-%llu-%llu.dat",
+						(unsigned long long)block_start,
+						(unsigned long long)block_end);
+		}
 		if (!input->file)
 			goto err_file;
 		reader_init(&input->reader, input->file,
@@ -2391,6 +2417,12 @@ static int merge_files(const char *filename1, const char *filename_plain,
 
 	assert(inputs[0].item == NULL);
 	assert(inputs[1].item == NULL);
+
+	/* Write the final header at the start of the file. */
+	rc = write_header(&writer, ftello(writer.file->file),
+			  block_start, block_end);
+	if (rc != MDBX_SUCCESS)
+		goto err;
 
 	fprintf(stderr, "Finished merge_files (%d) file_out=%s -> read=%llu+%llu accounts=%llu storage_slots=%llu\n",
 		num_inputs, file_out->name,
@@ -2517,8 +2549,8 @@ static void show_usage(void)
 		"-q    Don't output some messages\n"
 		"-p    Print accounts and storages as they are written\n"
 		"-s    Show contents of a file instead of doing transformations\n"
-		"-S    Like -S but for files with strategy 1\n"
-		"-T    Like -S but for files with strategy 3\n",
+		"-S    Like -s but for files with strategy 1\n"
+		"-T    Like -s but for post-merge files with page layout\n",
 		prog);
 	exit(EXIT_FAILURE);
 }
@@ -2526,6 +2558,7 @@ static void show_usage(void)
 int main(int argc, char *argv[]) {
 	bool opt_show = false;
 	int opt_strategy = 0;
+	off_t opt_offset = 0;
 
 	prog = argv[0];
 	if (argc < 2)
@@ -2542,6 +2575,7 @@ int main(int argc, char *argv[]) {
 			break;
 		case 's':
 			opt_show = true;
+			opt_strategy = 0;
 			break;
 		case 'S':
 			opt_show = true;
@@ -2549,7 +2583,8 @@ int main(int argc, char *argv[]) {
 			break;
 		case 'T':
 			opt_show = true;
-			opt_strategy = 1;
+			opt_strategy = 0;
+			opt_offset = 256;
 			break;
 		default:
 			show_usage();
@@ -2564,7 +2599,7 @@ int main(int argc, char *argv[]) {
 	const char *input_db_path = argv[optind];
 
 	if (opt_show) {
-		int rc = show_file(opt_strategy, input_db_path);
+		int rc = show_file(opt_strategy, opt_offset, input_db_path);
 		if (rc == MDBX_NOTFOUND)
 			rc = MDBX_SUCCESS;
 		if (rc == MDBX_EINTR && opt_verbose)

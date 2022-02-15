@@ -450,10 +450,23 @@ static struct File *file_open(bool for_write, const char *format, ...)
 		file_name_size *= 2;
 	}
 
+	/*
+	 * Unlink the file if it already exists, so we can make "copies" by
+	 * hard-linking, and this code won't truncate or overwrite them.
+	 */
+	if (for_write && unlink(file->name) != 0 && errno != ENOENT) {
+		int save_error = errno;
+		perror("unlink");
+		errno = save_error;
+		return NULL;
+	}
+
 	file->file = fopen(file->name, for_write ? "w" : "r");
 	if (!file->file) {
 		int save_error = errno;
 		perror("fopen");
+		fprintf(stderr, "fopen: %s: While opening %s\n",
+			strerror(errno), file->name);
 		free(file);
 		errno = save_error;
 		return NULL;

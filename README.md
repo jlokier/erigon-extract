@@ -1,6 +1,93 @@
-# Generate a compact state history database for Ethereum Mainnet
+# Super-compact "archive mode" state history for Ethereum Mainnet
 
-## Usage
+## Size headline figures
+
+**Mainnet Ethereum "archive mode" state history in 167.47&nbsp;GiB**.
+(Blocks 0 to 13818907.  The final block is dated 2021-12-16 22:38:47 UTC).
+
+This compares extremely favourably\* with [8,646&nbsp;GiB and 8,719&nbsp;GiB
+(charts)](https://etherscan.io/chartsync/chainarchive) used by popular
+implementations Geth and OpenEthereum respectively at the same time frame.
+
+It's a profound improvement over [22,911&nbsp;GiB for
+Nimbus-eth1](https://github.com/status-im/nimbus-eth1/issues/863)
+(=&nbsp;24.6&nbsp;TB), which this approach to storage was designed to address.
+
+\* Note that those Etherscan charts show space used by other things than just
+state-history, but state-history accounts for almost all of that space.  To
+finish the comparison, minimum required Merkle hashes, block bodies, block
+headers, contract code and receipts must be added.  Some more space on top is
+required in an actively updated database.  Some experiments have been done and
+there are good reasons to believe all those things can be fitted in less than
+420&nbsp;GiB more "estimated worst case".
+
+## Pruned size
+
+"Pruned mode" state history comes to **25.03&nbsp;GiB**.  (Blocks
+13728908-13818907, 90k history).
+
+This also compares favourably\* with [pruned mode
+charts](https://etherscan.io/chartsync/chaindefault), but the picture is more
+complicated with pruned state, as the other things contribute more
+significantly to the size in those charts.  Even so, the pruned state size is
+promising.
+
+## Lookup performance
+
+Any account or storage can be looked up at any point in block time in O(log N)
+time using these files.  This proof of concept is focused more on demonstrating
+small size than time, so the constant factor of the big-O notation is quite
+high, but when fully optimised the constant factor will be superbly low for
+IOPS, and reasonable for CPU and memory.
+
+## Summary of this program
+
+This program makes a compact version of the entire Ethereum Mainnet state
+history, sometimes called "archive mode".
+
+It reads the state history from a database made by
+[Erigon](https://github.com/ledgerwatch/erigon), and outputs a new,
+super-compact database.
+
+The new format is both a compressed file and a database, and can be used
+directly as full archive data set.  Even though it looks too simple to be
+updated efficiently, it actually can be updated in place with the right
+algorithms: It really is a prepopulated database as well as a compressed file.
+Both reads (queries) and writes (updates) take O(log N) time.O(log N) time.
+
+## Space first, speed second
+
+This is a proof of concept designed to highlight space used, rather than time.
+
+The super-compact database is part of an implementation in progress of an
+on-disk data structure designed to be fast as well, for Ethereum use cases.
+Specifically, fast at random-access writes for EVM execution, and fast with low
+write-amplification for network state synchronisation.  It is neither a B-tree
+nor an LSM-tree but has elements of both.
+
+However the current implementation iss not a particularly fast O(log N).  The
+time constant needs to be improved, and the number of I/O operations (IOPS) is
+also higher than necessary.
+
+R&D is ongoing in improving the format and in the query and update algorithms.
+It's likely the size will increase as critical features and performance
+metadata are added.
+
+Speed will improve greatly when index blocks and structures inside each block
+are added to improve the performance.  With those in place, the IOPS will drop
+to less than 1 IOPS per account/storage query on average, during EVM executions,
+even at Mainnet archive scale.
+
+The structure is also designed to support fast network sync, and to store the
+received data efficiently without write-amplification.
+
+The ad-hoc encoding of individual values has been through many iterations to
+optimise the assignment of bits and opcodes to different purposes, but there
+are several changes to add which have been identified.  These reduce the size
+further, but the index structures to speed up reads and writes will likely take
+more than the amount saved by better compression.
+
+## How to use this program
 
 You will need:
 
@@ -21,7 +108,8 @@ make
 # Or symbolic link to your preferred location:
 mkdir data
 
-# Use the path to Erigon's `chaindata` directory.  `-M` is important:
+# Use the path to Erigon's `chaindata` directory.  `-M` is important,
+# otherwise it will take a very long time to run on Mainnet:
 ./erigon_extract -M ~/.erigon/mainnet/chaindata
 ```
 
@@ -31,21 +119,18 @@ The final output file is called something like
 `./data/full-history-0-13818907.dat` for Mainnet at block number 13818907.
 
 That file contains the entire "archive mode" accounts and storage history from
-blocks 0 up to that block number.  At blocks 0-13818907 the total size is
-**<&nbsp;200&nbsp;GiB**.
+blocks 0 up to that block number.
 
-This `README` will be updated with an accurate size when it's available, as
-there is an issue in progress.  As a reference point, the component files take
-**121.54&nbsp;GiB**, but the merge process tends to expand it by 10-20%, so I'm
-giving a conservative "< 200 GiB" right now.
+**Mainnet full history currently takes 167.47&nbsp;GiB**.
 
 Other networks can also be used, and the starting block can be changed by
 editing the code.  A "pruned mode" 90k blocks file can be generated using the
-`-P` option.
+`-P` option.  **Mainnet pruned to 90k blocks currently takes 25.03&nbsp;GiB.**
 
 The data format has been tested more with Goerli testnet than Mainnet at this
 point, but there is no reason to think they are different except for scale.
-**The Goerli file is 10.6&nbsp;GiB**.
+**The Goerli archive mode file is 10.6&nbsp;GiB**, and **Goerli pruned is
+3.18&nbsp;GiB**.
 
 ## Summary
 
